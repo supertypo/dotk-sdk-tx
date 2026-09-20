@@ -1,0 +1,14 @@
+# Tools
+.idea/
+.vscode/
+.DS_Store
+
+# Installed and built. What is generated elsewhere is committed here on purpose; see AGENTS.md.
+node_modules/
+dist/
+*.tsbuildinfo
+*.log
+
+# A local environment file, such as the live test's endpoints, never leaves the machine.
+.env
+.env.*
