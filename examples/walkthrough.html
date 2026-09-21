@@ -1,0 +1,592 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>@dotk/sdk-tx by example</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        --line: color-mix(in srgb, currentColor 20%, transparent);
+        --soft: color-mix(in srgb, currentColor 6%, transparent);
+      }
+      body {
+        max-width: 62rem;
+        margin: 0 auto;
+        padding: 1.5rem 1rem 4rem;
+        font:
+          16px/1.55 system-ui,
+          sans-serif;
+      }
+      h1 {
+        margin-bottom: 0.25rem;
+      }
+      h2 {
+        margin: 0 0 0.35rem;
+        font-size: 1.1rem;
+      }
+      h3 {
+        margin: 1.1rem 0 0.35rem;
+        font-size: 0.95rem;
+      }
+      p {
+        margin: 0.5rem 0;
+      }
+      code,
+      pre {
+        font-family: ui-monospace, monospace;
+        font-size: 0.85rem;
+      }
+      nav {
+        margin: 1rem 0;
+        padding: 0.75rem 1rem;
+        border: 1px solid var(--line);
+        border-radius: 0.5rem;
+      }
+      nav ol {
+        margin: 0.25rem 0 0;
+        padding-left: 1.25rem;
+        columns: 2;
+      }
+      section {
+        margin: 1rem 0;
+        padding: 0.9rem 1rem;
+        border: 1px solid var(--line);
+        border-radius: 0.5rem;
+      }
+      figure {
+        position: relative;
+        margin: 0.6rem 0 0;
+      }
+      pre {
+        overflow-x: auto;
+        margin: 0;
+        padding: 0.7rem 0.8rem;
+        border-radius: 0.35rem;
+        background: var(--soft);
+      }
+      button {
+        position: absolute;
+        top: 0.4rem;
+        right: 0.4rem;
+        font: inherit;
+        font-size: 0.75rem;
+        padding: 0.15rem 0.5rem;
+        border: 1px solid var(--line);
+        border-radius: 0.35rem;
+        background: Canvas;
+        color: inherit;
+        cursor: pointer;
+        opacity: 0.5;
+      }
+      figure:hover button,
+      button:focus {
+        opacity: 1;
+      }
+      table {
+        margin-top: 0.6rem;
+        border-collapse: collapse;
+        font-size: 0.9rem;
+      }
+      th,
+      td {
+        padding: 0.25rem 0.9rem 0.25rem 0;
+        text-align: left;
+        vertical-align: top;
+        border-bottom: 1px solid var(--line);
+      }
+      footer {
+        margin-top: 2rem;
+        font-size: 0.85rem;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>@dotk/sdk-tx by example</h1>
+    <p>
+      This page walks through every operation the package builds: a registration, a records save, a subname, a transfer,
+      a release and a sweep. Each one shows the code, the plan it answers with, and the point where the wallet asks the
+      person to sign.
+    </p>
+    <p>
+      Nothing on this page runs. Every operation here spends coins and needs a signature, so a page that ran them would
+      need your wallet and your money. Read it beside
+      <a href="https://www.npmjs.com/package/@dotk/sdk-tx">the package</a>, and copy what you need.
+    </p>
+    <p>
+      The figures are real. They come from a plan this package built against mainnet's deployment, for the five-letter
+      name <code>alice.k</code>, at the fee floor a node relays at. Your own numbers move with the name's length, with
+      the node's feerate and with the coins the wallet holds. A sompi is 1e-8 KAS.
+    </p>
+
+    <nav>
+      Operations
+      <ol>
+        <li><a href="#wiring">What you wire up</a></li>
+        <li><a href="#register">Register a name</a></li>
+        <li><a href="#activate">Finish a half-landed registration</a></li>
+        <li><a href="#records">Save records</a></li>
+        <li><a href="#subnames">Point a subname at an address</a></li>
+        <li><a href="#transfer">Hand a name over</a></li>
+        <li><a href="#release">End a registration</a></li>
+        <li><a href="#sweep">Reclaim leftover cards</a></li>
+        <li><a href="#signing">What the wallet is asked</a></li>
+        <li><a href="#refusals">When something refuses</a></li>
+      </ol>
+    </nav>
+
+    <section id="wiring">
+      <h2>What you wire up</h2>
+      <p>
+        The package holds no key and dials nothing. You give it a node, a signer and the account that owns the names.
+        The read client from <code>@dotk/sdk</code> comes with it, because a plan reads the registry before it builds.
+      </p>
+      <figure>
+        <pre>
+import { Dotk } from '@dotk/sdk'
+import { Registrar, nodesOver } from '@dotk/sdk-tx'
+
+// One connected wasm RpcClient gives both halves. Reading and writing ask different
+// things of a node, so they are two objects.
+const { read, tx } = nodesOver(rpcClient, 'mainnet')
+
+const dotk = new Dotk({ node: read }) // an unqualified client addresses mainnet
+const address = 'kaspa:qp8n2k7uklxq4aegau7vawtptkgxsja4kt99lpv6krctwpq8tpc6547zhh9u4'
+const account = { address, ...dotk.ownerOf(address) }
+// account.ownerType  0
+// account.owner      '4f355bdcb7cc0af728ef3cceb9615d90684bb5b2ca5f859ab0f0b704075871aa'
+
+const registrar = new Registrar({ dotk, node: tx, signer, account, timeoutMs: 20_000 })</pre>
+      </figure>
+      <p>
+        A signer is a wallet reduced to one method. It signs the inputs this package names, by index, under SIGHASH_ALL,
+        and it changes nothing else. KasWare's <code>signPskt</code> and Kastle's <code>signTx</code> both do this.
+      </p>
+      <figure>
+        <pre>
+const signer = {
+  async sign(request) {
+    // request.txJson          the transaction, as JSON
+    // request.fundingInputs   inputs paying from the account's own address
+    // request.ownerSigInputs  inputs holding the name or a card, which pay to a script
+    //                         the wallet does not know
+    // `signByIndex` stands for your wallet's own call. It signs those indices and nothing else.
+    return await wallet.signByIndex(request.txJson, [...request.fundingInputs, ...request.ownerSigInputs])
+  },
+  // 0 is a schnorr key. Refusing here refuses the plan, before a person approves anything.
+  supportsOwnerScheme: (ownerType) => ownerType === 0,
+}</pre>
+      </figure>
+      <p>
+        Without a wasm client, <code>nodesOverWrpc(call, network)</code> takes any transport, and
+        <code>WrpcJson.connect('ws://your-node:18110')</code> is a client of this package's own. A node must run with
+        <code>--rpclisten-json</code> to answer that one, and it must be new enough to report covenant ids.
+      </p>
+    </section>
+
+    <section id="register">
+      <h2>Register a name</h2>
+      <p>
+        A registration is two transactions. The commit splits the gap that covers the name and writes a PENDING deed
+        holding the bond and the deposit. The reveal spends that deed, pays the tier to the devfund and leaves the deed
+        ACTIVE.
+      </p>
+      <figure>
+        <pre>
+const plan = await registrar.planRegistration('alice.k')
+
+// plan.name     'alice'
+// plan.deed     'kaspa:pq6ekafamup9ndgc09a5x0y2mc45n827x4mk0t4l63rg6jrnlz8c7hhus4lwv'
+// plan.tier     3_800_000_000n   38 KAS to the devfund, by the name's length
+// plan.locked     200_000_000n   2 KAS, the bond and the gap value, both refunded by a release
+// plan.fee          4_767_630n   0.0477 KAS, the two network fees together
+// plan.commit.assembled.fee  3_001_740n
+// plan.reveal.assembled.fee  1_765_890n
+
+// Show the tier, the locked value and the fee. Then register it. This plans again,
+// takes both signatures, and only then sends the commit.
+const { commit, reveal } = await registrar.register('alice.k')
+// the user signs here: the commit's funding coin, prompt 1 of 2
+// the user signs here: the reveal's funding coin, prompt 2 of 2
+
+// commit  '0ece236c9bd4f6f9aadf13e9af582d6b4b5c17911f44afe7de445a75c8708b37'
+// reveal  '20107cff528aeb9b35f79aa59007ed8655f5d4008cfd752b0bec4a6cb5d36f47'</pre>
+      </figure>
+      <p>
+        Both halves are built and measured before either one is signed, because the commit's change funds the reveal. A
+        funding amount that leaves the commit relayable can put the reveal under KIP-9's storage floor, and nothing
+        about the commit says so. Both signatures come before the commit goes out, so a refusal at the wallet costs a
+        prompt and not a name committed to and unrevealed.
+      </p>
+      <p>
+        Between the two halves the name is reserved and the deposit is at risk. A PENDING deed that nobody reveals can
+        be evicted after <code>t_evict</code>, 3000 DAA, which is about five minutes. The deposit goes to whoever evicts
+        it.
+      </p>
+      <p>Price it before you build, and make sure that the name is free, both through the read client:</p>
+      <figure>
+        <pre>
+await dotk.available('alice.k') // true
+dotk.quote('alice.k')
+// { name: 'alice', fee: 3800000000, bond: 100000000, deposit: 3600000000,
+//   gapValue: 100000000, lockedValue: 200000000, totalToFund: 4000000000 }</pre>
+      </figure>
+      <p>
+        <code>totalToFund</code> is what the wallet must hold, 40 KAS, with the network fee left out. The deposit comes
+        back on the reveal, so what has to be on hand is the larger of the deposit and the tier, never their sum.
+      </p>
+    </section>
+
+    <section id="activate">
+      <h2>Finish a half-landed registration</h2>
+      <p>
+        If the commit lands and the node refuses the reveal, the name is reserved and nothing owns it yet.
+        <code>register</code> says so and names the way back in. The reveal carries no signature of its own, so this
+        account can rebuild it on a fresh coin.
+      </p>
+      <figure>
+        <pre>
+const plan = await registrar.planActivate('alice.k')
+
+// plan.deed  'kaspa:pq6ekafamup9ndgc09a5x0y2mc45n827x4mk0t4l63rg6jrnlz8c7hhus4lwv'
+// plan.tier  3_800_000_000n
+// plan.fee       1_765_890n
+
+const txid = await registrar.submit(plan)
+// the user signs here: the funding coin alone. Knowledge of the claim authorizes the rest.</pre>
+      </figure>
+      <p>
+        The PENDING deed is found by deriving its address and reading the chain, so this works from any machine that
+        holds the name and the owner key.
+      </p>
+    </section>
+
+    <section id="records">
+      <h2>Save records</h2>
+      <p>
+        A name's records ride in a card, which is one output beside the deed. A save is therefore a transfer to the
+        owner the deed already has. It sweeps the live card and mints the new one, so the value of a card comes back in
+        the same transaction it goes out in.
+      </p>
+      <figure>
+        <pre>
+const plan = await registrar.planRecords('alice.k', {
+  url: 'https://alice.example',
+  'com.github': 'alice',
+  primary: true,
+})
+
+// plan.fee                  2_029_125n   0.0203 KAS
+// plan.cards.minted         true
+// plan.cards.swept          1            the live card, and its 0.5 KAS, come back
+// plan.cards.value          0n           one card out, one card in
+// plan.cards.carried        []           opaque values the new card keeps
+// plan.cards.dropped        []           opaque values the given set replaced
+// plan.cards.subnames       [{ label: 'bob', address: 'kaspa:qq789twm…', change: 'unchanged' }]
+// plan.cards.subnamesDropped []
+// plan.cards.cardRead       true         this package read the live card
+// plan.cards.complete       true         the set was merged over what the card holds
+
+const txid = await registrar.submit(plan)
+// the user signs here: the deed at input 0, the old card at input 1, the coin at input 2</pre>
+      </figure>
+      <p>
+        A save merges. Every value of the live card under a key the given set does not name is carried into the new
+        card, opaque values and <code>sub:</code> entries alike. Show <code>carried</code> and
+        <code>dropped</code> before the wallet opens, because a payee list built from values this package recognizes can
+        never name an opaque one.
+      </p>
+      <p>Clearing is the same transfer with nothing minted:</p>
+      <figure>
+        <pre>
+const txid = await registrar.saveRecords('alice.k', null)
+// the user signs here
+
+// plan.fee                   1_963_710n
+// plan.cards.minted          false
+// plan.cards.swept           1
+// plan.cards.value        -50_000_000n   more comes back than goes out, so it is negative
+// plan.cards.subnamesDropped [{ label: 'bob', address: 'kaspa:qq789twm…' }]</pre>
+      </figure>
+      <p>
+        <code>cardRead: false</code> means this package could not read the live card, through a missing API, a name the
+        API does not know, a card the node refutes, or a listing it could not read. A records save throws on the last
+        case, because a save writes the card back. A mint that follows a false here can drop what nobody can read.
+      </p>
+    </section>
+
+    <section id="subnames">
+      <h2>Point a subname at an address</h2>
+      <p>
+        A <code>sub:</code> record points a label at an address. <code>bob.alice.k</code> is the label
+        <code>bob</code> on the card of <code>alice.k</code>, and <code>@dotk/sdk</code> resolves it. The payee is the
+        claim of the name's owner, and the chain proves none of it.
+      </p>
+      <figure>
+        <pre>
+import { ownerOfParsed, parseAddress, subnameKey, subnameValue } from '@dotk/sdk'
+
+const payee = 'kaspa:qqkqkl8e2vj2qlg98x9jgqt5msxzhezym943tx4xclmmrengdqyezj4f6urkg'
+const { ownerType, owner } = ownerOfParsed(parseAddress(payee, dotk.prefix))
+
+const plan = await registrar.planRecords('alice.k', {
+  [subnameKey('pay')]: subnameValue(ownerType, owner),
+})
+
+// plan.fee  2_028_180n
+// plan.cards.subnames
+//   [{ label: 'bob', address: 'kaspa:qq789twm…', change: 'unchanged' },
+//    { label: 'pay', address: 'kaspa:qqkqkl8e…', change: 'added' }]
+
+const txid = await registrar.submit(plan)
+// the user signs here</pre>
+      </figure>
+      <p>
+        The label <code>bob</code> is unchanged and still there, because the save carried it. Show
+        <code>subnames</code> before the wallet signs. An added, a changed and a refused entry each show in full, and
+        the unchanged payees fold into a count. A refused entry carries <code>address: null</code> and a
+        <code>fault</code> tag, and it never folds.
+      </p>
+      <p>
+        <code>dropSubnames</code> is the one way a save ends an entry, and it names each label as the card stores it:
+      </p>
+      <figure>
+        <pre>
+const plan = await registrar.planRecords('alice.k', { url: 'https://alice.example' }, { dropSubnames: ['bob'] })
+// plan.cards.subnamesDropped  [{ label: 'bob', address: 'kaspa:qq789twm…' }]</pre>
+      </figure>
+      <p>
+        A transfer retires the card, so it ends every subname on it. Three plans do that: a transfer that mints no card,
+        a transfer to another owner, and a sweep.
+      </p>
+    </section>
+
+    <section id="transfer">
+      <h2>Hand a name over</h2>
+      <p>
+        A transfer moves the deed to the address you name. It sweeps this account's cards on the name by default,
+        because moving the deed retires them.
+      </p>
+      <figure>
+        <pre>
+const to = 'kaspa:qprx6l72u437tjcf5rgcwza4sq6ysprp0pu6zj2feu3zshcm4cljwzyxcndsc'
+const plan = await registrar.planTransfer('alice.k', to)
+
+// plan.recipient  'kaspa:qprx6l72…'   what the person typed. Show this one.
+// plan.fromDeed   'kaspa:pq6ekafa…'   where the deed sits now
+// plan.toDeed     'kaspa:ppdqvw76…'   where it sits once this confirms
+// plan.fee          1_963_710n
+// plan.cards.swept  1
+// plan.cards.value  -50_000_000n      the card's 0.5 KAS returns with the change
+// plan.cards.subnamesDropped  [{ label: 'bob', address: 'kaspa:qq789twm…' }]
+
+const txid = await registrar.submit(plan)
+// the user signs here: the deed at input 0, the card at input 1, the coin at input 2
+
+// txid  'e78d2707444f9d3606c7c8d174d956683bf96cdf9fcc59556856f337d5fc4f68'</pre>
+      </figure>
+      <p>
+        Show <code>recipient</code> to the person. <code>fromDeed</code> and <code>toDeed</code> are script addresses
+        that a reader cannot check against anything they know.
+      </p>
+      <p>Two options change what rides along:</p>
+      <figure>
+        <pre>
+// Mint the new owner's card in the same transaction. Every sub: entry it carries is `added`.
+await registrar.planTransfer('alice.k', to, { records: { url: 'https://bob.example' } })
+// plan.fee  2_021_670n, plan.cards.minted true
+
+// Leave this account's cards where they are, for a later sweep.
+await registrar.planTransfer('alice.k', to, { sweep: false })
+// plan.fee  1_729_035n, plan.cards.swept 0, ownerSigInputs [0], fundingInputs [1]</pre>
+      </figure>
+      <p>
+        <code>transfer(name, to)</code> plans, signs and sends in one call, for a screen that shows nothing in between.
+      </p>
+    </section>
+
+    <section id="release">
+      <h2>End a registration</h2>
+      <p>
+        A release kills the deed and merges the two gaps that flanked it into one. The transaction takes the predecessor
+        gap, the deed and the successor gap, and writes a single widened gap. Only the deed's seat is signed, and the
+        other two consent by being present.
+      </p>
+      <figure>
+        <pre>
+const plan = await registrar.planRelease('alice.k')
+
+// plan.fromDeed   'kaspa:pq6ekafa…'
+// plan.fee          5_170_200n   0.0517 KAS, the largest of these transactions
+// plan.returned   194_829_800n   1.948 KAS, the bond and the gap value, less the fee
+
+const txid = await registrar.submit(plan)
+// the user signs here: the deed at input 1, and the coin at input 3</pre>
+      </figure>
+      <p>
+        Show <code>returned</code>, because it is what the balance changes by. The two flanking gaps come from the API
+        and each one is proved against the node before the build. A gap's address hashes from its bounds, and nothing in
+        the name yields them, so a node can confirm a pair but never find one. A client with no API passes them itself
+        as <code>{ neighbours }</code>.
+      </p>
+    </section>
+
+    <section id="sweep">
+      <h2>Reclaim leftover cards</h2>
+      <p>
+        A card holds 0.5 KAS, and it is the spender's to take back. A transfer sweeps the ones it retires. Anything left
+        from <code>{ sweep: false }</code>, or minted by a name this account no longer holds, comes back here. The cards
+        pay for it, so this transaction needs no coin.
+      </p>
+      <figure>
+        <pre>
+const plan = await registrar.planSweep() // one name: planSweep('alice.k')
+
+// plan.cards  2
+// plan.value  99_477_520n   what the cards hold, less the fee
+// plan.fee       522_480n
+
+const txid = await registrar.submit(plan)
+// the user signs here: both cards, inputs 0 and 1. Nothing else is in the transaction.</pre>
+      </figure>
+      <p>
+        A sweep takes what the API lists for the account's key and the node still holds. A client built with
+        <code>api: null</code> lists nothing, so it sweeps nothing.
+      </p>
+    </section>
+
+    <section id="signing">
+      <h2>What the wallet is asked</h2>
+      <p>
+        Every plan carries a <code>request</code> you can hand a wallet as it stands. The registration carries one on
+        each half. The indices are the ones from the transfer above.
+      </p>
+      <figure>
+        <pre>
+plan.request
+// {
+//   txJson: '{"version":1,"inputs":[…],"outputs":[…]}',
+//   fundingInputs: [2],     // pays from the account's own address
+//   ownerSigInputs: [0, 1], // the deed, and the card the transfer sweeps
+// }</pre>
+      </figure>
+      <p>
+        An owner input pays to a P2SH address derived from the name, or from a card's state. A wallet that matches
+        inputs against its own addresses finds nothing there and signs none of them, which is why the signing goes by
+        index. Each signature is 65 bytes, 64 of signature and then <code>0x01</code> for SIGHASH_ALL. A funding input
+        comes back as one 66-byte push. An owner input comes back as the script it was given, with its 65 zero bytes
+        overwritten in place.
+      </p>
+      <p>
+        This package verifies every signature against the assembled transaction before it sends anything. A wallet that
+        signs the wrong input, the wrong sighash type or nothing at all is caught here, and the node never sees it.
+      </p>
+    </section>
+
+    <section id="refusals">
+      <h2>When something refuses</h2>
+      <p>
+        A plan is built and measured before a wallet opens, so a refusal costs nothing. Everything this package throws
+        extends <code>DotkError</code> from <code>@dotk/sdk</code>, and its own classes extend <code>TxError</code>.
+      </p>
+      <figure>
+        <pre>
+import { InsufficientFundingError, MassCeilingError, SubmitError } from '@dotk/sdk-tx'
+
+try {
+  const txid = await registrar.submit(plan)
+  // the user signs here
+} catch (e) {
+  if (e instanceof SubmitError) {
+    if (e.verdict === 'transient') return retry(plan) // the same bytes, unchanged
+    if (e.verdict === 'stale') return rebuild() // a fresh plan, and a second approval
+    return show(e.message) // fatal: the node refuses these bytes for good
+  }
+  if (e instanceof InsufficientFundingError) return topUp(e.have, e.need)
+  if (e instanceof MassCeilingError) return askForAnotherCoin(e.dimension)
+  throw e
+}</pre>
+      </figure>
+      <table>
+        <tr>
+          <th>Error</th>
+          <th>When</th>
+        </tr>
+        <tr>
+          <td><code>InsufficientFundingError</code></td>
+          <td>the wallet holds too little, or holds no coin at all where one has to sign the change</td>
+        </tr>
+        <tr>
+          <td><code>FeeCeilingError</code></td>
+          <td>the fee came out above 5 KAS, which is a rail and never a setting</td>
+        </tr>
+        <tr>
+          <td><code>MassCeilingError</code></td>
+          <td>a node will not carry the transaction, over one of the three mass caps</td>
+        </tr>
+        <tr>
+          <td><code>SigningError</code></td>
+          <td>the wallet's answer is not one this package can use</td>
+        </tr>
+        <tr>
+          <td><code>SubmitError</code></td>
+          <td>the node refused the transaction, and <code>verdict</code> says whether a retry can help</td>
+        </tr>
+        <tr>
+          <td><code>UndecodableCardError</code></td>
+          <td>a live card's blob is not a record set, and a save would wipe what it cannot read</td>
+        </tr>
+        <tr>
+          <td><code>NodeError</code></td>
+          <td>the node could not be reached, or refused the call before it had an opinion</td>
+        </tr>
+      </table>
+      <p>
+        After a submission whose outcome is unknown, a dropped socket, a timeout or a cancel in flight, the coins it
+        spent count as spent. The next plan therefore cannot offer them to a second prompt. Call
+        <code>registrar.resync()</code> once the node's view has settled, such as after the transaction shows up or
+        after a minute has passed.
+      </p>
+      <figure>
+        <pre>
+try {
+  await registrar.submit(plan)
+} catch (e) {
+  // ... the transaction may or may not have gone out
+}
+
+await sometime()
+registrar.resync() // read the wallet as the node reports it</pre>
+      </figure>
+    </section>
+
+    <footer>
+      <p>
+        <a href="https://www.npmjs.com/package/@dotk/sdk-tx">@dotk/sdk-tx</a> builds, signs and sends.
+        <a href="https://www.npmjs.com/package/@dotk/sdk">@dotk/sdk</a> reads, and its own example page runs live in a
+        browser. <a href="https://dotk.name">dotk.name</a> is the web app.
+      </p>
+    </footer>
+
+    <script>
+      for (const figure of document.querySelectorAll('figure')) {
+        const button = document.createElement('button')
+        button.type = 'button'
+        button.textContent = 'Copy'
+        button.addEventListener('click', async () => {
+          const code = figure.querySelector('pre')
+          try {
+            await navigator.clipboard.writeText(code.textContent)
+            button.textContent = 'Copied'
+          } catch {
+            // A browser that refuses the clipboard still lets the reader copy a selection.
+            getSelection().selectAllChildren(code)
+            button.textContent = 'Selected'
+          }
+          setTimeout(() => (button.textContent = 'Copy'), 1200)
+        })
+        figure.append(button)
+      }
+    </script>
+  </body>
+</html>
