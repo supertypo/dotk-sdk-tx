@@ -11,6 +11,10 @@ npm install @dotk/sdk @dotk/sdk-tx
 This package asks you for a node and a signer. A wallet already has both. Nothing here dials
 anything or holds a key.
 
+[examples/walkthrough.html](examples/walkthrough.html) shows every operation on one page: the
+code, the plan it answers with, and the point where the wallet asks for a signature. Open it in a
+browser. It runs nothing, because every operation here spends coins.
+
 ## Use
 
 ```ts
