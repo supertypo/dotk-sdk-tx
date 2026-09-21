@@ -185,9 +185,10 @@ npm run lint && npm run typecheck && npm run format:check && npm test && npm run
 
 4. Update the documentation that the change touches. Write what an integrator can see under a
    `## <next version>` heading in `CHANGELOG.md`.
-5. Commit with a short message, directly on `main`. A mechanical reformat is its own commit, after
-   the functional one.
-6. Run `git push`. Never leave finished work as local-only commits.
+5. Commit with a short message, on a feature branch, never on `main`. A mechanical reformat is its
+   own commit, after the functional one. `main` is the branch a release is cut from, so work
+   reaches it through a pull request that a maintainer merges.
+6. Run `git push -u origin <your branch>`. Never leave finished work as local-only commits.
 
 CI runs the five on every push and pull request, under `.github/workflows/ci.yml`. It runs them
 after the fact, so the sequence above still runs before a push. The package is in production.
