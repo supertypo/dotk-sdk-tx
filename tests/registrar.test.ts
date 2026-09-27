@@ -30,16 +30,28 @@ import {
 } from '@dotk/sdk'
 import { DotkError, NodeError as SdkNodeError } from '@dotk/sdk'
 import { schnorr } from '@noble/curves/secp256k1.js'
-import { describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { txNodeOverWasm } from '../src/adapters.js'
 import { emptyTx } from '../src/tx.js'
 import type { Account, SignRequest, Signer, SpendableUtxo, TxNode } from '../src/ports.js'
-import { InsufficientFundingError, NodeError, TxError, UndecodableCardError } from '../src/errors.js'
+import {
+  CommitNotMinedError,
+  InsufficientFundingError,
+  NodeError,
+  TxError,
+  UndecodableCardError,
+} from '../src/errors.js'
 import { COINBASE_MATURITY } from '../src/mass.js'
-import { Registrar, scriptPublicKeyOf } from '../src/registrar.js'
+import {
+  DEFAULT_COMMIT_MINED_POLL_MS,
+  DEFAULT_COMMIT_MINED_TIMEOUT_MS,
+  Registrar,
+  type RegistrationPlanned,
+  scriptPublicKeyOf,
+} from '../src/registrar.js'
 import { mergeRecords } from '../src/records.js'
 import type { Gap } from '../src/release.js'
-import { schnorrSighash } from '../src/sighash.js'
+import { schnorrSighash, transactionId } from '../src/sighash.js'
 import { SIGHASH_ALL, patchPlaceholder } from '../src/sign.js'
 import { deedAddressOfState } from '../src/transfer.js'
 import type { Tx } from '../src/tx.js'
@@ -1512,42 +1524,317 @@ describe('registering a name', () => {
     expect(submitted).toEqual([])
   })
 
-  it('sends the commit and then the reveal, in that order', async () => {
-    const gap = coveringGap()
+  /**
+   * A node on which the commit mines only after `probes` questions about the PENDING deed. Until
+   * then the address holds only `before`, a deed some other commit left. `log` records each
+   * probe and each submission in the order the node saw them.
+   */
+  function miningNode(
+    planned: RegistrationPlanned,
+    over: {
+      probes?: number
+      before?: SpendableUtxo[]
+      fail?: (probe: number) => boolean
+      submit?: TxNode['submit']
+      /** The account's coins once the commit is sent. */
+      coins?: SpendableUtxo[]
+      onProbe?: (probe: number) => Promise<void>
+    } = {}
+  ) {
+    const pending = pendingDeed()
+    const newborn = { ...pending.utxo, outpoint: planned.reveal.assembled.tx.inputs[0]!.previousOutpoint }
     const submitted: Tx[] = []
-    const node = nodeHolding({}, submitted)
-    const planner = new Registrar({ dotk, node, signer: new LocalSigner(), account })
-    const planned = await planner.planRegistration(NAME, { gap })
+    const log: string[] = []
+    let probes = 0
+    const inner = fakeNode({ submitted })
+    const node: TxNode = {
+      ...inner,
+      utxosOf: async (a) => {
+        if (a === address && over.coins && log.includes('submit')) return over.coins
+        if (a !== pending.address) return inner.utxosOf(a)
+        const probe = ++probes
+        log.push('probe')
+        await over.onProbe?.(probe)
+        if (over.fail?.(probe)) throw new Error('connect ECONNREFUSED 127.0.0.1:18210')
+        return log.includes('submit') && probe > (over.probes ?? 0) ? [newborn] : (over.before ?? [])
+      },
+      submit: async (tx, options) => {
+        log.push('submit')
+        if (over.submit) return over.submit(tx, options)
+        submitted.push(tx)
+        return transactionId(tx)
+      },
+    }
+    return { node, submitted, log, probes: () => probes }
+  }
 
-    const wallet = new ScriptedSigner([planned.commit.assembled.tx, planned.reveal.assembled.tx])
-    const registrar = new Registrar({ dotk, node, signer: wallet, account })
-    const sent = await registrar.register(NAME, { gap })
+  /** A registration planned on a node that shows no deed, so the plan is what the test controls. */
+  async function planned(): Promise<{ gap: Gap; plan: RegistrationPlanned }> {
+    const gap = coveringGap()
+    const planner = new Registrar({ dotk, node: nodeHolding({}), signer: new LocalSigner(), account })
+    return { gap, plan: await planner.planRegistration(NAME, { gap }) }
+  }
+
+  function walletFor(plan: RegistrationPlanned, refuseAt = 0): ScriptedSigner {
+    return new ScriptedSigner([plan.commit.assembled.tx, plan.reveal.assembled.tx], refuseAt)
+  }
+
+  const quick = { minedPollMs: 1, minedTimeoutMs: 1_000 }
+
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  it('sends the commit, waits for it to be mined, and only then sends the reveal', async () => {
+    const { gap, plan } = await planned()
+    // A deed of another commit at the same address is not this one mined.
+    const stale = { ...pendingDeed().utxo, outpoint: { transactionId: 'ab'.repeat(32), index: 2 } }
+    const mining = miningNode(plan, { probes: 3, before: [stale] })
+    const registrar = new Registrar({ dotk, node: mining.node, signer: walletFor(plan), account })
+    const sent = await registrar.register(NAME, { gap, ...quick })
     expect(sent.commit).toMatch(/^[0-9a-f]{64}$/)
-    expect(submitted).toHaveLength(2)
-    expect(submitted[0]!.inputs[0]!.previousOutpoint).toEqual(gap.outpoint)
-    expect(submitted[1]!.outputs[0]!.value).toBe(BigInt(registry.params.bond))
+    expect(mining.log).toEqual(['submit', 'probe', 'probe', 'probe', 'probe', 'submit'])
+    expect(mining.submitted).toHaveLength(2)
+    expect(mining.submitted[0]!.inputs[0]!.previousOutpoint).toEqual(gap.outpoint)
+    expect(mining.submitted[1]!.outputs[0]!.value).toBe(BigInt(registry.params.bond))
+  })
+
+  it('asks again after a node call fails during the wait', async () => {
+    const { gap, plan } = await planned()
+    const mining = miningNode(plan, { probes: 0, fail: (probe) => probe === 1 })
+    const registrar = new Registrar({ dotk, node: mining.node, signer: walletFor(plan), account })
+    await registrar.register(NAME, { gap, ...quick })
+    expect(mining.log).toEqual(['submit', 'probe', 'probe', 'submit'])
+  })
+
+  it('holds the reveal back and says how to finish when the commit is not mined in time', async () => {
+    const { gap, plan } = await planned()
+    const mining = miningNode(plan, { probes: Infinity })
+    const registrar = new Registrar({ dotk, node: mining.node, signer: walletFor(plan), account })
+    const e = await registrar.register(NAME, { gap, minedPollMs: 1, minedTimeoutMs: 30 }).catch((e: unknown) => e)
+    expect(e).toBeInstanceOf(CommitNotMinedError)
+    expect(e).toBeInstanceOf(TxError)
+    const error = e as CommitNotMinedError
+    expect(error.nameOf).toBe(NAME)
+    expect(error.commit).toBe(plan.reveal.assembled.tx.inputs[0]!.previousOutpoint.transactionId)
+    expect(error.timeoutMs).toBe(30)
+    expect(error.message).toMatch(/planActivate\('kaspa'\)/)
+    // Every probe answered, so no failure is the cause.
+    expect(error.cause).toBeUndefined()
+    expect(mining.submitted).toHaveLength(1)
+    expect(mining.log.at(-1)).toBe('probe')
+  })
+
+  it('keeps the failure of the last question as the cause', async () => {
+    const { gap, plan } = await planned()
+    const mining = miningNode(plan, { probes: Infinity, fail: () => true })
+    const registrar = new Registrar({ dotk, node: mining.node, signer: walletFor(plan), account })
+    const e = await registrar.register(NAME, { gap, minedPollMs: 1, minedTimeoutMs: 10 }).catch((e: unknown) => e)
+    expect(e).toBeInstanceOf(CommitNotMinedError)
+    expect((e as Error).cause).toBeInstanceOf(NodeError)
+    expect(mining.submitted).toHaveLength(1)
+  })
+
+  it('waits two seconds between questions and two minutes in all, by default', async () => {
+    vi.useFakeTimers()
+    const { gap, plan } = await planned()
+    const mining = miningNode(plan, { probes: Infinity })
+    const registrar = new Registrar({ dotk, node: mining.node, signer: walletFor(plan), account })
+    const outcome = registrar.register(NAME, { gap }).catch((e: unknown) => e)
+    await vi.advanceTimersByTimeAsync(DEFAULT_COMMIT_MINED_TIMEOUT_MS)
+    const e = await outcome
+    expect(e).toBeInstanceOf(CommitNotMinedError)
+    expect((e as CommitNotMinedError).timeoutMs).toBe(DEFAULT_COMMIT_MINED_TIMEOUT_MS)
+    // The fake clock stands still until the test advances it, so the probe count is exact.
+    expect(mining.probes()).toBe(DEFAULT_COMMIT_MINED_TIMEOUT_MS / DEFAULT_COMMIT_MINED_POLL_MS + 1)
+    expect(mining.submitted).toHaveLength(1)
+  })
+
+  it("ends the wait on the caller's cancel, with their reason and no reveal sent", async () => {
+    const { gap, plan } = await planned()
+    const controller = new AbortController()
+    const reason = new Error('the user closed the panel')
+    const mining = miningNode(plan, { probes: Infinity })
+    const registrar = new Registrar({ dotk, node: mining.node, signer: walletFor(plan), account })
+    // The pause between two probes is a minute, so the cancel lands inside it.
+    const outcome = registrar.register(NAME, { gap, minedPollMs: 60_000, signal: controller.signal })
+    await vi.waitFor(() => expect(mining.probes()).toBe(1))
+    controller.abort(reason)
+    await expect(outcome).rejects.toBe(reason)
+    expect(mining.log).toEqual(['submit', 'probe'])
+  })
+
+  it('chains the reveal through the mempool without a wait when the caller asks for it', async () => {
+    const { gap, plan } = await planned()
+    const mining = miningNode(plan, { probes: Infinity })
+    const registrar = new Registrar({ dotk, node: mining.node, signer: walletFor(plan), account })
+    await registrar.register(NAME, { gap, chainThroughMempool: true })
+    expect(mining.log).toEqual(['submit', 'submit'])
+  })
+
+  it('refuses a wait that makes no sense before the wallet is asked', async () => {
+    const { gap, plan } = await planned()
+    const mining = miningNode(plan)
+    const wallet = walletFor(plan)
+    const registrar = new Registrar({ dotk, node: mining.node, signer: wallet, account })
+    await expect(registrar.register(NAME, { gap, minedPollMs: 0 })).rejects.toThrow(/minedPollMs/)
+    await expect(registrar.register(NAME, { gap, minedTimeoutMs: Number.NaN })).rejects.toThrow(/minedTimeoutMs/)
+    expect(wallet.prompts).toBe(0)
+    expect(mining.log).toEqual([])
+  })
+
+  it('waits for the commit between two submits of its own', async () => {
+    const { plan } = await planned()
+    const mining = miningNode(plan, { probes: 1 })
+    const signer = new LocalSigner()
+    const registrar = new Registrar({ dotk, node: mining.node, signer, account })
+    signer.tx = plan.commit.assembled.tx
+    await registrar.submit(plan.commit)
+    await registrar.waitForCommit(plan, quick)
+    signer.tx = plan.reveal.assembled.tx
+    await registrar.submit(plan.reveal)
+    expect(mining.log).toEqual(['submit', 'probe', 'probe', 'submit'])
+  })
+
+  it('keeps the commit change from another plan while it holds the reveal', async () => {
+    const { gap, plan } = await planned()
+    const funding = plan.reveal.assembled.tx.inputs[1]!.previousOutpoint
+    const change: SpendableUtxo = {
+      ...coin,
+      outpoint: funding,
+      amount: plan.commit.assembled.tx.outputs[funding.index]!.value,
+    }
+    let during: unknown
+    const mining = miningNode(plan, {
+      probes: 1,
+      coins: [change],
+      onProbe: async (probe) => {
+        if (probe === 1) during = await registrar.planTransfer(NAME, recipient).catch((e: unknown) => e)
+      },
+    })
+    const registrar = new Registrar({ dotk, node: mining.node, signer: walletFor(plan), account })
+    await registrar.register(NAME, { gap, ...quick })
+    expect(during).toBeInstanceOf(InsufficientFundingError)
+    expect(mining.submitted).toHaveLength(2)
+
+    // A wait that runs out lets the change go, so another plan can fund from it.
+    const stalled = miningNode(plan, { probes: Infinity, coins: [change] })
+    const again = new Registrar({ dotk, node: stalled.node, signer: walletFor(plan), account })
+    await expect(again.register(NAME, { gap, minedPollMs: 1, minedTimeoutMs: 5 })).rejects.toBeInstanceOf(
+      CommitNotMinedError
+    )
+    await expect(again.planTransfer(NAME, recipient)).resolves.toBeDefined()
+  })
+
+  it('ends a probe that hangs at the deadline of the wait', async () => {
+    const { plan } = await planned()
+    const mining = miningNode(plan, { onProbe: () => new Promise(() => undefined) })
+    const registrar = new Registrar({ dotk, node: mining.node, signer: new LocalSigner(), account, timeoutMs: null })
+    const e = await registrar.waitForCommit(plan, { minedPollMs: 1, minedTimeoutMs: 20 }).catch((e: unknown) => e)
+    expect(e).toBeInstanceOf(CommitNotMinedError)
+    expect((e as Error).cause).toBeInstanceOf(TimeoutError)
+  })
+
+  it('sends no reveal when the node answers another id for the commit', async () => {
+    const { gap, plan } = await planned()
+    const mining = miningNode(plan, { submit: async () => 'cc'.repeat(32) })
+    const registrar = new Registrar({ dotk, node: mining.node, signer: walletFor(plan), account })
+    await expect(registrar.register(NAME, { gap, ...quick })).rejects.toThrow(/did not send the reveal/)
+    expect(mining.log).toEqual(['submit'])
+  })
+
+  it('refuses to wait on a registration another account planned', async () => {
+    const { plan } = await planned()
+    const other = schnorr.getPublicKey(schnorr.utils.randomSecretKey())
+    const stranger: Account = {
+      address: encodeAddress('kaspatest', Version.PubKey, other),
+      ownerType: OwnerType.Pubkey,
+      owner: toHex(other),
+    }
+    const mining = miningNode(plan)
+    const registrar = new Registrar({ dotk, node: mining.node, signer: new LocalSigner(), account: stranger })
+    await expect(registrar.waitForCommit(plan, quick)).rejects.toThrow(/not planned for/)
+    expect(mining.log).toEqual([])
+  })
+
+  it('gives up on its own when called directly', async () => {
+    const { plan } = await planned()
+    const mining = miningNode(plan, { probes: Infinity })
+    const registrar = new Registrar({ dotk, node: mining.node, signer: new LocalSigner(), account })
+    await expect(registrar.waitForCommit(plan, { minedPollMs: 1, minedTimeoutMs: 5 })).rejects.toBeInstanceOf(
+      CommitNotMinedError
+    )
+  })
+
+  it('answers a signal that is already aborted with its reason, before it asks the node', async () => {
+    const { plan } = await planned()
+    const mining = miningNode(plan)
+    const registrar = new Registrar({ dotk, node: mining.node, signer: new LocalSigner(), account })
+    const reason = new Error('gone')
+    await expect(registrar.waitForCommit(plan, { ...quick, signal: AbortSignal.abort(reason) })).rejects.toBe(reason)
+    expect(mining.log).toEqual([])
+  })
+
+  it('asks the node once when the wait has no time at all, and refuses a limit no timer holds', async () => {
+    const { plan } = await planned()
+    const mining = miningNode(plan, { probes: Infinity })
+    const registrar = new Registrar({ dotk, node: mining.node, signer: new LocalSigner(), account })
+    await expect(registrar.waitForCommit(plan, { minedTimeoutMs: 0 })).rejects.toBeInstanceOf(CommitNotMinedError)
+    expect(mining.probes()).toBe(1)
+    await expect(registrar.waitForCommit(plan, { minedTimeoutMs: 2 ** 31 })).rejects.toThrow(/minedTimeoutMs/)
+    await expect(registrar.waitForCommit(plan, { minedPollMs: 2 ** 31 })).rejects.toThrow(/minedPollMs/)
+  })
+
+  it('ends the wait on a cancel that lands while the node is being asked', async () => {
+    const { plan } = await planned()
+    const controller = new AbortController()
+    const reason = new Error('gone')
+    const mining = miningNode(plan, {
+      probes: Infinity,
+      onProbe: async () => controller.abort(reason),
+    })
+    const registrar = new Registrar({ dotk, node: mining.node, signer: new LocalSigner(), account })
+    await expect(registrar.waitForCommit(plan, { ...quick, signal: controller.signal })).rejects.toBe(reason)
+    expect(mining.probes()).toBe(1)
+  })
+
+  it('keeps the change struck when the reveal has no known outcome', async () => {
+    const { gap, plan } = await planned()
+    const funding = plan.reveal.assembled.tx.inputs[1]!.previousOutpoint
+    const change: SpendableUtxo = {
+      ...coin,
+      outpoint: funding,
+      amount: plan.commit.assembled.tx.outputs[funding.index]!.value,
+    }
+    let sends = 0
+    const mining = miningNode(plan, {
+      coins: [change],
+      submit: async (tx) => {
+        if (++sends === 2) throw new Error('connect ECONNREFUSED 127.0.0.1:18210')
+        return transactionId(tx)
+      },
+    })
+    const registrar = new Registrar({ dotk, node: mining.node, signer: walletFor(plan), account })
+    await expect(registrar.register(NAME, { gap, ...quick })).rejects.toThrow(/planActivate/)
+    await expect(registrar.planTransfer(NAME, recipient)).rejects.toBeInstanceOf(InsufficientFundingError)
+    registrar.resync()
+    await expect(registrar.planTransfer(NAME, recipient)).resolves.toBeDefined()
   })
 
   it('names the way back in when the reveal is refused after the commit lands', async () => {
-    const gap = coveringGap()
-    const submitted: Tx[] = []
-    const node = nodeHolding({}, submitted)
-    const planner = new Registrar({ dotk, node, signer: new LocalSigner(), account })
-    const planned = await planner.planRegistration(NAME, { gap })
-
+    const { gap, plan } = await planned()
     let sends = 0
-    const refusing: TxNode = {
-      ...node,
+    const mining = miningNode(plan, {
       submit: async (tx) => {
         if (++sends === 2) throw new Error('transaction is not standard')
-        submitted.push(tx)
-        return 'cc'.repeat(32)
+        return transactionId(tx)
       },
-    }
-    const wallet = new ScriptedSigner([planned.commit.assembled.tx, planned.reveal.assembled.tx])
-    const registrar = new Registrar({ dotk, node: refusing, signer: wallet, account })
-    await expect(registrar.register(NAME, { gap })).rejects.toThrow(/planActivate/)
-    expect(submitted).toHaveLength(1)
+    })
+    const registrar = new Registrar({ dotk, node: mining.node, signer: walletFor(plan), account })
+    const e = await registrar.register(NAME, { gap, ...quick }).catch((e: unknown) => e)
+    expect(e).not.toBeInstanceOf(CommitNotMinedError)
+    expect((e as Error).message).toMatch(/a node refused its reveal.*planActivate/)
+    expect(sends).toBe(2)
   })
 })
 

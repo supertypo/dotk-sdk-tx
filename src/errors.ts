@@ -79,6 +79,35 @@ export class UndecodableCardError extends TxError {
   }
 }
 
+/**
+ * A registration's commit went out, and the node did not show it mined before the wait ran out,
+ * so this package held the reveal back.
+ *
+ * Once the node shows the commit mined, a PENDING deed holds the name, and `Registrar.planActivate`
+ * finishes the registration. If the commit never mines, no PENDING deed exists. The registrar
+ * that sent the commit then refuses its gap, so a new registration of the name needs a fresh
+ * `Registrar`.
+ */
+export class CommitNotMinedError extends TxError {
+  override name = 'CommitNotMinedError'
+  constructor(
+    readonly nameOf: string,
+    /** The commit's transaction id. */
+    readonly commit: string,
+    /** The limit the wait ran to, in milliseconds. */
+    readonly timeoutMs: number,
+    options?: { cause?: unknown }
+  ) {
+    super(
+      `${nameOf} is committed but not revealed. The node did not show the commit ${commit} mined within ` +
+        `${timeoutMs} ms, so this package held the reveal back. Once the commit is mined, run ` +
+        `planActivate('${nameOf}') before the eviction window closes. After that, anyone can evict the PENDING deed. ` +
+        'The evictor takes the name bond and the gap value, and the deposit goes to the devfund',
+      options
+    )
+  }
+}
+
 /** The node refused the transaction. `verdict` says whether anything is worth retrying. */
 export class SubmitError extends TxError {
   override name = 'SubmitError'

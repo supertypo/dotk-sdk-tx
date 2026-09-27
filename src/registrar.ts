@@ -37,7 +37,7 @@ import { assembleSweep, cardMint, type CardPlan, type CardSweep } from './cards.
 import { COINBASE_MATURITY } from './mass.js'
 import { transactionId } from './sighash.js'
 
-import { NodeError, SubmitError, TxError, UndecodableCardError } from './errors.js'
+import { CommitNotMinedError, NodeError, SubmitError, TxError, UndecodableCardError } from './errors.js'
 import { bytes32Of, bytesOf } from './hex.js'
 import type { Account, Signer, SignRequest, SpendableUtxo, TxNode } from './ports.js'
 import { classify } from './reject.js'
@@ -104,8 +104,21 @@ export interface Planned {
   readonly ownerSigInputs: number[]
 }
 
+/** How often {@link Registrar.waitForCommit} asks the node whether the commit is mined, in milliseconds. */
+export const DEFAULT_COMMIT_MINED_POLL_MS = 2_000
+/** How long {@link Registrar.waitForCommit} waits for the commit to be mined, in milliseconds. */
+export const DEFAULT_COMMIT_MINED_TIMEOUT_MS = 120_000
+
+/** How a caller paces the wait between a registration's commit and its reveal. */
+export interface CommitWaitOptions extends NodeCallOptions {
+  /** The pause between two questions to the node. It defaults to `DEFAULT_COMMIT_MINED_POLL_MS`. */
+  minedPollMs?: number | undefined
+  /** How long to wait before giving up. It defaults to `DEFAULT_COMMIT_MINED_TIMEOUT_MS`. */
+  minedTimeoutMs?: number | undefined
+}
+
 /** What a caller can tell a registration. */
-export interface RegisterOptions extends NodeCallOptions {
+export interface RegisterOptions extends CommitWaitOptions {
   /**
    * The gap covering the name's key. Without an `api` you must give it, for the reason you must
    * give `neighbours`.
@@ -117,6 +130,14 @@ export interface RegisterOptions extends NodeCallOptions {
    * exact. It defaults to 0.2 KAS, which is ten times the floor.
    */
   buffer?: bigint | undefined
+  /**
+   * Send the reveal straight after the commit, through the mempool, with no wait for the commit
+   * to be mined. The reveal publishes the name. While the commit is unmined, another transaction
+   * can still spend its gap. So anyone who reads the name from the mempool can race a commit of
+   * their own for it. Set this only for names that nobody races for, for example in bulk seeding.
+   * This method then ignores `minedPollMs` and `minedTimeoutMs`.
+   */
+  chainThroughMempool?: boolean | undefined
 }
 
 /** Cost and shape of a registration, both halves judged together. */
@@ -130,7 +151,10 @@ export interface RegistrationPlanned {
   fee: bigint
   /** What stays locked in the name: the bond and the gap value, both refunded by a release. */
   locked: bigint
-  /** The commit, and the reveal built on its change. Submit them in this order and no other. */
+  /**
+   * The commit, and the reveal built on its change. Submit the commit, wait for it to be mined
+   * with {@link Registrar.waitForCommit}, and only then submit the reveal.
+   */
   commit: Planned
   reveal: Planned
 }
@@ -272,6 +296,41 @@ function outpointKey(o: Outpoint): string {
   return `${o.transactionId}:${o.index}`
 }
 
+/** The longest delay a timer honors. */
+const MAX_TIMER_MS = 2_147_483_647
+
+function sameOutpoint(a: Outpoint, b: Outpoint): boolean {
+  return a.index === b.index && a.transactionId.toLowerCase() === b.transactionId.toLowerCase()
+}
+
+/** The pacing of a commit wait, refused before anything is sent if a caller's figure makes no sense. */
+function commitWait(options: CommitWaitOptions | undefined): { pollMs: number; timeoutMs: number } {
+  const pollMs = options?.minedPollMs ?? DEFAULT_COMMIT_MINED_POLL_MS
+  const timeoutMs = options?.minedTimeoutMs ?? DEFAULT_COMMIT_MINED_TIMEOUT_MS
+  // A timer fires at once past this delay, so a larger figure would turn the wait into a busy loop.
+  if (!Number.isFinite(pollMs) || pollMs <= 0 || pollMs > MAX_TIMER_MS) {
+    throw new TxError(`minedPollMs must be a positive number of milliseconds up to ${MAX_TIMER_MS}, not ${pollMs}`)
+  }
+  if (!Number.isFinite(timeoutMs) || timeoutMs < 0 || timeoutMs > MAX_TIMER_MS) {
+    throw new TxError(`minedTimeoutMs must be from 0 to ${MAX_TIMER_MS} milliseconds, not ${timeoutMs}`)
+  }
+  return { pollMs, timeoutMs }
+}
+
+/** A pause that the caller's cancel ends early. The caller reads the signal after it. */
+function pause(ms: number, signal: AbortSignal | undefined): Promise<void> {
+  return new Promise((resolve) => {
+    const done = () => {
+      clearTimeout(timer)
+      signal?.removeEventListener('abort', done)
+      resolve()
+    }
+    const timer = setTimeout(done, ms)
+    signal?.addEventListener('abort', done, { once: true })
+    if (signal?.aborted) done()
+  })
+}
+
 /**
  * Register operations against one account. Every method is build, sign, submit in that order, and
  * each step is reachable on its own, so a caller can show a cost before a wallet opens.
@@ -290,6 +349,11 @@ export class Registrar {
   private readonly spent = new Set<string>()
   /** The coins of submissions whose outcome is unknown, which a resync forgets. */
   private readonly doubtful = new Set<string>()
+  /**
+   * The commit's change while `register` holds the reveal that spends it. The node lists that
+   * coin once the commit is mined, and a plan built in the meantime would take it from the reveal.
+   */
+  private readonly held = new Set<string>()
 
   /**
    * Forget the coins of submissions whose outcome was unknown, a socket that dropped, a call that
@@ -319,7 +383,7 @@ export class Registrar {
 
   private struck(outpoint: Outpoint): boolean {
     const key = outpointKey(outpoint)
-    return this.spent.has(key) || this.doubtful.has(key)
+    return this.spent.has(key) || this.doubtful.has(key) || this.held.has(key)
   }
 
   constructor(options: RegistrarOptions) {
@@ -342,10 +406,11 @@ export class Registrar {
   private async asked<T>(
     what: string,
     options: NodeCallOptions | undefined,
-    work: (signal?: AbortSignal) => Promise<T>
+    work: (signal?: AbortSignal) => Promise<T>,
+    timeoutMs: number | null = this.timeoutMs
   ): Promise<T> {
     try {
-      return await withDeadline(what, this.timeoutMs, options?.signal, (signal) => work(signal))
+      return await withDeadline(what, timeoutMs, options?.signal, (signal) => work(signal))
     } catch (e) {
       if (options?.signal?.aborted) throw options.signal.reason
       if (e instanceof DotkError || (e instanceof Error && e.name === 'AbortError')) throw e
@@ -688,8 +753,8 @@ export class Registrar {
    * This method builds and measures both before it signs either. A funding amount can leave the
    * commit perfectly relayable and the reveal over KIP-9's storage floor, which shows only once
    * the second transaction stands on the first's remainder. In the other order the commit is on
-   * chain by the time anyone finds out. The name is reserved, and the deposit is on its way to
-   * whoever evicts it.
+   * chain by the time anyone finds out. The name is reserved, and an eviction pays its deposit
+   * to the devfund.
    *
    * The reveal carries no signature, because knowing the claim's preimage is its whole
    * authorization. Anyone holding the name and the owner key can therefore recover a registration
@@ -779,27 +844,139 @@ export class Registrar {
   }
 
   /**
-   * Plan a registration, take both signatures, and send both halves in order.
+   * Plan a registration, take both signatures, send the commit, wait for it to be mined, and
+   * send the reveal.
    *
    * This method takes the reveal's signature before it sends the commit, so a refusal at the
-   * wallet costs a prompt, not a name committed to and unrevealed. If the node refuses the reveal
-   * after the commit lands, the error names {@link planActivate}, which rebuilds the reveal from
-   * another coin.
+   * wallet costs a prompt, not a name committed to and unrevealed.
+   *
+   * The reveal publishes the name, so this method holds it until the node shows the commit
+   * mined, as {@link waitForCommit} does. Before that, anyone who reads the name can race a
+   * commit of their own for the same gap. `chainThroughMempool` skips the wait.
+   *
+   * If the wait runs out, the error is a {@link CommitNotMinedError}. If the node refuses the
+   * reveal after the commit lands, the error names {@link planActivate}, which rebuilds the
+   * reveal from another coin. A cancel during the wait comes back as the caller's own reason,
+   * with the commit sent and the reveal not. {@link planActivate} finishes that case too.
    */
   async register(name: string, options?: RegisterOptions): Promise<{ commit: string; reveal: string }> {
+    // Read before anything is signed, so an option this method refuses costs no commit.
+    const wait = options?.chainThroughMempool === true ? null : commitWait(options)
     const planned = await this.planRegistration(name, options)
+    // The wait refuses a plan of another account, so that check runs here too, before any signing.
+    if (wait) this.newbornOf(planned)
     const commitTx = await this.signedTx(planned.commit)
     const revealTx = await this.signedTx(planned.reveal)
-    const commit = await this.send(commitTx, options)
+    const change = revealTx.inputs.slice(1).map((input) => outpointKey(input.previousOutpoint))
+    for (const key of change) this.held.add(key)
     try {
-      return { commit, reveal: await this.send(revealTx, options) }
+      const commit = await this.send(commitTx, options)
+      const newborn = planned.reveal.assembled.tx.inputs[0]!.previousOutpoint
+      if (commit.toLowerCase() !== newborn.transactionId.toLowerCase()) {
+        throw new TxError(
+          `the node answered ${commit} for the commit of ${planned.name}, and its reveal spends ${newborn.transactionId}, ` +
+            `so this package did not send the reveal. Once the commit is mined, run planActivate('${planned.name}')`
+        )
+      }
+      if (wait) await this.untilMined(planned, wait, options)
+      return { commit, reveal: await this.sendReveal(planned.name, revealTx, options) }
+    } finally {
+      for (const key of change) this.held.delete(key)
+    }
+  }
+
+  /** The reveal of {@link register}, whose refusal names the way back in. */
+  private async sendReveal(name: string, revealTx: Tx, options: NodeCallOptions | undefined): Promise<string> {
+    try {
+      return await this.send(revealTx, options)
     } catch (cause) {
+      if (options?.signal?.aborted) throw options.signal.reason
       throw new TxError(
-        `${planned.name} is committed but not revealed. The commit is on chain and a node refused its reveal. ` +
-          `Run planActivate('${planned.name}') to finish it from another coin, before anyone can evict it`,
+        `${name} is committed but not revealed. The commit is sent and a node refused its reveal. ` +
+          `Run planActivate('${name}') to finish it from another coin, before anyone can evict it`,
         { cause }
       )
     }
+  }
+
+  /**
+   * Wait until the node shows a registration's commit mined, which is when its reveal is safe to
+   * send. It answers once the PENDING deed address holds the output that the reveal spends.
+   *
+   * A caller that submits the two halves itself calls this between them. Nothing then keeps the
+   * commit's change from another plan on this registrar, which would take it from the reveal, so
+   * such a caller builds no other plan until the reveal is sent. This method asks the node every
+   * `minedPollMs` and gives up after `minedTimeoutMs` with a {@link CommitNotMinedError}. A node
+   * call that fails is a failed question and not an answer, so the wait asks again. The last
+   * failure is the error's `cause`.
+   */
+  async waitForCommit(planned: RegistrationPlanned, options?: CommitWaitOptions): Promise<void> {
+    return this.untilMined(planned, commitWait(options), options)
+  }
+
+  /**
+   * The PENDING deed a registration's commit writes, refused unless it is this account's. A plan
+   * of another account's would be waited on at an address that never holds it.
+   */
+  private newbornOf(planned: RegistrationPlanned): { outpoint: Outpoint; address: string } {
+    const outpoint = planned.reveal.assembled.tx.inputs[0]!.previousOutpoint
+    const pending = this.pendingDeedOf(planned.name)
+    const output = planned.commit.assembled.tx.outputs[outpoint.index]
+    if (
+      output?.scriptPublicKey.toLowerCase() !== pending.scriptPublicKey ||
+      outpoint.transactionId.toLowerCase() !== transactionId(planned.commit.assembled.tx)
+    ) {
+      throw new TxError(`that registration of ${planned.name} was not planned for ${this.account.address}`)
+    }
+    return { outpoint, address: pending.address }
+  }
+
+  private async untilMined(
+    planned: RegistrationPlanned,
+    wait: { pollMs: number; timeoutMs: number },
+    options: NodeCallOptions | undefined
+  ): Promise<void> {
+    const { outpoint: newborn, address } = this.newbornOf(planned)
+    const deadline = Date.now() + wait.timeoutMs
+    let failure: unknown
+    for (;;) {
+      // A probe ends by the deadline, give or take one pause, so a hung call cannot stretch the wait.
+      const left = Math.max(deadline - Date.now(), wait.pollMs)
+      try {
+        const utxos = await this.asked(
+          'node',
+          options,
+          (signal) => this.node.utxosOf(address, signal ? { signal } : undefined),
+          this.timeoutMs === null ? left : Math.min(this.timeoutMs, left)
+        )
+        if (utxos.some((u) => sameOutpoint(u.outpoint, newborn))) return
+        failure = undefined
+      } catch (e) {
+        if (options?.signal?.aborted) throw options.signal.reason
+        failure = e
+      }
+      const remaining = deadline - Date.now()
+      if (remaining <= 0) {
+        throw new CommitNotMinedError(planned.name, newborn.transactionId, wait.timeoutMs, { cause: failure })
+      }
+      await pause(Math.min(wait.pollMs, remaining), options?.signal)
+      options?.signal?.throwIfAborted()
+    }
+  }
+
+  /** Where a name's PENDING deed sits under this account's claim, with the state that places it. */
+  private pendingDeedOf(bare: string): {
+    key: Uint8Array
+    claim: Uint8Array
+    address: string
+    scriptPublicKey: string
+  } {
+    const owner = this.account
+    const key = fromHex(this.dotk.keyOf(bare))
+    const claim = names.claimOf(bare, owner.ownerType, bytes32Of(owner.owner, 'owner'))
+    const state = encodePendingDeedState(key, claim)
+    const address = this.dotk.protocol.deed.address(this.dotk.prefix, state).text
+    return { key, claim, address, scriptPublicKey: toHex(this.dotk.protocol.deed.scriptPublicKey(state)) }
   }
 
   /**
@@ -816,9 +993,7 @@ export class Registrar {
     this.requireSigner()
     const bare = this.dotk.normalize(name)
     const owner = this.account
-    const key = fromHex(this.dotk.keyOf(bare))
-    const claim = names.claimOf(bare, owner.ownerType, bytes32Of(owner.owner, 'owner'))
-    const at = registry.deed.address(this.dotk.prefix, encodePendingDeedState(key, claim)).text
+    const { key, claim, address: at } = this.pendingDeedOf(bare)
     const utxos = await this.asked('node', options, (signal) => this.node.utxosOf(at, signal ? { signal } : undefined))
     const held = utxos.find((u) => u.covenantId?.toLowerCase() === registry.registryCovenantId)
     if (!held) {

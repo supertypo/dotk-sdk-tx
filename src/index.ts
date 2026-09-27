@@ -1,6 +1,6 @@
 export { WrpcJson, DEFAULT_CALL_TIMEOUT_MS, DEFAULT_CONNECT_TIMEOUT_MS, nodeOver } from './wrpc.js'
 export type { ConnectOptions } from './wrpc.js'
-export { Registrar } from './registrar.js'
+export { Registrar, DEFAULT_COMMIT_MINED_POLL_MS, DEFAULT_COMMIT_MINED_TIMEOUT_MS } from './registrar.js'
 export { mergeRecords } from './records.js'
 export type { DroppedSubname, MergedRecords, MergeOptions, PlannedSubname } from './records.js'
 export { activateIntent, splitIntent } from './register.js'
@@ -9,6 +9,7 @@ export { releaseIntent, widenedGapState } from './release.js'
 export type { Gap, ReleasePlan } from './release.js'
 export type {
   ActivationPlanned,
+  CommitWaitOptions,
   RecordsOptions,
   RegistrarOptions,
   RegisterOptions,
@@ -61,6 +62,7 @@ export type { Arg } from './abi.js'
 export { Script, scriptNumber } from './script.js'
 export {
   TxError,
+  CommitNotMinedError,
   InsufficientFundingError,
   FeeCeilingError,
   MassCeilingError,

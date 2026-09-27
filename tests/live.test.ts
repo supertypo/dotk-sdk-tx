@@ -212,6 +212,8 @@ live('against a real node', () => {
       signerA.tx = plan.commit.assembled.tx
       const commit = await asA.submit(plan.commit)
       expect(commit).toBe(JSON.parse(plan.commit.request.txJson).id)
+      // The reveal waits for the commit to be mined.
+      await asA.waitForCommit(plan)
       signerA.tx = plan.reveal.assembled.tx
       const reveal = await asA.submit(plan.reveal)
       expect(reveal).toBe(JSON.parse(plan.reveal.request.txJson).id)

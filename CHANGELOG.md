@@ -2,6 +2,25 @@
 
 The record starts at 1.2.0.
 
+## 2.1.0
+
+- `register` sends the reveal only once the node shows the commit mined. The reveal publishes the
+  name. While the commit is unmined, anyone who reads the name can race a commit of their own for
+  the same gap. So `register` takes at least one block. The wait asks the node every
+  `DEFAULT_COMMIT_MINED_POLL_MS`, 2 seconds, for up to `DEFAULT_COMMIT_MINED_TIMEOUT_MS`, 2
+  minutes. `minedPollMs` and `minedTimeoutMs` in the exported `CommitWaitOptions` set both.
+- When the wait runs out, `register` throws `CommitNotMinedError` with the commit's transaction id
+  and does not send the reveal. A cancel during the wait leaves the commit sent and the reveal
+  not. In both cases, `planActivate` finishes the registration once the commit is mined.
+- `Registrar.waitForCommit(plan)` is the same wait. A caller that submits `plan.commit` and
+  `plan.reveal` itself must call it between the two submits. A reveal sent before the commit is
+  mined is open to the same race. Until the reveal is sent, such a caller builds no other plan on
+  that registrar. A new plan can take the commit's change from the reveal.
+- `chainThroughMempool: true` sends the reveal straight after the commit, with no wait. It is for
+  names that nobody races for, such as a bulk seed.
+- The README says where an eviction sends a PENDING deed's deposit: to the devfund. The evictor
+  collects the bond and a gap value.
+
 ## 2.0.0
 
 - The write half's node adapters have their own names: `txNodeOverWasm` for `fromWasm` and

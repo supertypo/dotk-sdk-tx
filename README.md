@@ -45,11 +45,13 @@ When you show nothing in between, use `registrar.transfer(name, to)` to do both 
 
 This package builds and measures every plan before it signs anything, so a refusal costs nothing.
 `submit` signs what needs a signature and sends it. `submit` takes any plan but the registration.
-A registration is two transactions, so there you pass `plan.commit` and then `plan.reveal`.
+For a registration, which is two transactions, pass `plan.commit` to `submit`, call
+`waitForCommit(plan)`, and then pass `plan.reveal`.
 
 | Call                                            | What it does                                                                                                                               |
 | ----------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
 | `planRegistration(name)` / `register(name)`     | the commit and the reveal, both built and measured before either is signed                                                                 |
+| `waitForCommit(plan)`                           | wait until the node shows a registration's commit mined, which is when its reveal is safe to send                                          |
 | `planTransfer(name, to)` / `transfer(name, to)` | hand a name over, sweep the account's cards on it, and list the subnames it ends                                                           |
 | `planActivate(name)`                            | the reveal alone, for a registration whose commit landed without it                                                                        |
 | `planRelease(name)` / `release(name)`           | end a registration, and get the bond and the gap value back                                                                                |
@@ -92,7 +94,7 @@ publishes the name, pays the tier and leaves the deed ACTIVE. The gap comes from
 with no API passes `{ gap }` itself, as the release section says of `{ neighbours }`.
 
 Between the two, the name is reserved and the deposit is at risk. A PENDING deed that nobody
-reveals is evicted after `t_evict`, and the deposit goes to whoever evicts it.
+reveals is evicted after `t_evict`, and the eviction pays the deposit to the devfund.
 
 `planRegistration` builds both halves and measures both before either one is signed. This is not
 a convenience. The commit's change funds the reveal. So a funding amount can leave the commit
@@ -105,6 +107,24 @@ that headroom.
 
 This package signs both halves before it sends the commit, so a refusal at the wallet costs a
 prompt and not a name committed to and unrevealed.
+
+The reveal publishes the name, so `register` sends it only once the node shows the commit mined.
+While the commit is unmined, another transaction can still spend its gap. Anyone who reads the
+name from a reveal in the mempool can then race a commit of their own for the same gap and take
+the name.
+`register` asks the node every 2 seconds whether the PENDING deed address holds the commit's
+output. `{ minedPollMs, minedTimeoutMs }` set that pace and the 2-minute limit. A caller that
+submits the halves itself must call `waitForCommit(plan)` between them. Until the reveal is sent,
+such a caller builds no other plan on that registrar, because a plan can take the commit's change
+from the reveal.
+
+So `register` takes at least one block, and up to the limit. If the limit passes, `register`
+throws `CommitNotMinedError` and does not send the reveal. Once the commit is mined, a PENDING
+deed holds the name, and `planActivate(name)` finishes the registration. A cancel through
+`{ signal }` during the wait leaves the same state.
+
+`{ chainThroughMempool: true }` sends the reveal straight after the commit, with no wait. Use it
+only for names that nobody races for, such as a bulk seed.
 
 The reveal carries no signature. Knowledge of the claim's preimage is its whole authorization. So
 anyone who holds the name and the owner key can finish a registration that half-lands.
@@ -470,7 +490,7 @@ the test either. `AGENTS.md` says how to run it.
 
 Everything this package throws extends `DotkError` from `@dotk/sdk`, given input of the types its
 signatures declare. Its own classes, the first
-seven rows, extend `TxError`. The read client's own classes reach you unchanged, and a `catch` of
+eight rows, extend `TxError`. The read client's own classes reach you unchanged, and a `catch` of
 `TxError` does not cover them, so a `catch` of `DotkError` is the one that covers everything.
 
 | Error                      | When                                                                                                                                                                               |
@@ -481,6 +501,7 @@ seven rows, extend `TxError`. The read client's own classes reach you unchanged,
 | `MassCeilingError`         | a node will not carry the transaction, over one of the three mass caps. `dimension`                                                                                                |
 | `SigningError`             | the wallet's answer is not one this package can use                                                                                                                                |
 | `SubmitError`              | the node refused the transaction. `verdict` says whether a retry can help                                                                                                          |
+| `CommitNotMinedError`      | the node did not show a registration's commit mined in time, so this package held the reveal back. `nameOf`, `commit`, `timeoutMs`                                                 |
 | `UndecodableCardError`     | a live card's blob is not a record set, and a save would wipe what it cannot read                                                                                                  |
 | `NodeError`                | `@dotk/sdk`'s: the node could not be reached, or refused the call before it had an opinion                                                                                         |
 | `TimeoutError`             | `@dotk/sdk`'s: a call outlived `timeoutMs`                                                                                                                                         |

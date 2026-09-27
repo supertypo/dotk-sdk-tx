@@ -3,8 +3,8 @@
 // A `split` spends the gap covering the name's key and writes two narrower gaps and a PENDING
 // deed holding BOND + DEPOSIT. An `activate` spends that deed, reveals the name, pays the tier
 // fee to the devfund and leaves an ACTIVE deed at BOND. Between the two the PENDING deed reserves
-// the name, and one nobody activates is evicted after `t_evict` with the deposit going to the
-// evictor.
+// the name. Anyone can evict one that nobody activates after `t_evict`, and the eviction pays the
+// deposit to the devfund.
 //
 // The pair is therefore judged together and never one at a time. A funding amount can leave the
 // split perfectly relayable and the reveal over KIP-9's storage floor, which is visible only once
