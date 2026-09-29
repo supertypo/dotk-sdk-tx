@@ -116,7 +116,7 @@
     <p>
       The figures are real. They come from a plan this package built against mainnet's deployment, for the five-letter
       name <code>alice.k</code>, at the fee floor a node relays at. Your own numbers move with the name's length, with
-      the node's feerate and with the coins the wallet holds. A sompi is 1e-8 KAS.
+      the node's feerate, with how full its mempool is and with the coins the wallet holds. A sompi is 1e-8 KAS.
     </p>
 
     <nav>
@@ -199,12 +199,13 @@ const plan = await registrar.planRegistration('alice.k')
 // plan.deed     'kaspa:pq6ekafamup9ndgc09a5x0y2mc45n827x4mk0t4l63rg6jrnlz8c7hhus4lwv'
 // plan.tier     3_800_000_000n   38 KAS to the devfund, by the name's length
 // plan.locked     200_000_000n   2 KAS, the bond and the gap value, both refunded by a release
-// plan.fee          4_767_630n   0.0477 KAS, the two network fees together
-// plan.commit.assembled.fee  3_001_740n
-// plan.reveal.assembled.fee  1_765_890n
+// plan.fee          4_540_600n   0.0454 KAS, the two network fees together
+// plan.commit.assembled.fee  2_858_800n
+// plan.reveal.assembled.fee  1_681_800n
 
-// Show the tier, the locked value and the fee. Then register it. This plans again,
-// takes both signatures, and only then sends the commit.
+// Show the tier, the locked value and the fee. Then register it. This plans again and
+// takes both signatures. It sends the commit, waits until the node shows it mined, and
+// only then sends the reveal.
 const { commit, reveal } = await registrar.register('alice.k')
 // the user signs here: the commit's funding coin, prompt 1 of 2
 // the user signs here: the reveal's funding coin, prompt 2 of 2
@@ -250,7 +251,7 @@ const plan = await registrar.planActivate('alice.k')
 
 // plan.deed  'kaspa:pq6ekafamup9ndgc09a5x0y2mc45n827x4mk0t4l63rg6jrnlz8c7hhus4lwv'
 // plan.tier  3_800_000_000n
-// plan.fee       1_765_890n
+// plan.fee       1_681_800n
 
 const txid = await registrar.submit(plan)
 // the user signs here: the funding coin alone. Knowledge of the claim authorizes the rest.</pre>
@@ -276,7 +277,7 @@ const plan = await registrar.planRecords('alice.k', {
   primary: true,
 })
 
-// plan.fee                  2_029_125n   0.0203 KAS
+// plan.fee                  1_932_500n   0.0193 KAS
 // plan.cards.minted         true
 // plan.cards.swept          1            the live card, and its 0.5 KAS, come back
 // plan.cards.value          0n           one card out, one card in
@@ -302,7 +303,7 @@ const txid = await registrar.submit(plan)
 const txid = await registrar.saveRecords('alice.k', null)
 // the user signs here
 
-// plan.fee                   1_963_710n
+// plan.fee                   1_870_200n
 // plan.cards.minted          false
 // plan.cards.swept           1
 // plan.cards.value        -50_000_000n   more comes back than goes out, so it is negative
@@ -333,7 +334,7 @@ const plan = await registrar.planRecords('alice.k', {
   [subnameKey('pay')]: subnameValue(ownerType, owner),
 })
 
-// plan.fee  2_028_180n
+// plan.fee  1_931_600n
 // plan.cards.subnames
 //   [{ label: 'bob', address: 'kaspa:qq789twm…', change: 'unchanged' },
 //    { label: 'pay', address: 'kaspa:qqkqkl8e…', change: 'added' }]
@@ -375,7 +376,7 @@ const plan = await registrar.planTransfer('alice.k', to)
 // plan.recipient  'kaspa:qprx6l72…'   what the person typed. Show this one.
 // plan.fromDeed   'kaspa:pq6ekafa…'   where the deed sits now
 // plan.toDeed     'kaspa:ppdqvw76…'   where it sits once this confirms
-// plan.fee          1_963_710n
+// plan.fee          1_870_200n
 // plan.cards.swept  1
 // plan.cards.value  -50_000_000n      the card's 0.5 KAS returns with the change
 // plan.cards.subnamesDropped  [{ label: 'bob', address: 'kaspa:qq789twm…' }]
@@ -394,11 +395,11 @@ const txid = await registrar.submit(plan)
         <pre>
 // Mint the new owner's card in the same transaction. Every sub: entry it carries is `added`.
 await registrar.planTransfer('alice.k', to, { records: { url: 'https://bob.example' } })
-// plan.fee  2_021_670n, plan.cards.minted true
+// plan.fee  1_925_400n, plan.cards.minted true
 
 // Leave this account's cards where they are, for a later sweep.
 await registrar.planTransfer('alice.k', to, { sweep: false })
-// plan.fee  1_729_035n, plan.cards.swept 0, ownerSigInputs [0], fundingInputs [1]</pre>
+// plan.fee  1_646_700n, plan.cards.swept 0, ownerSigInputs [0], fundingInputs [1]</pre>
       </figure>
       <p>
         <code>transfer(name, to)</code> plans, signs and sends in one call, for a screen that shows nothing in between.
@@ -417,8 +418,8 @@ await registrar.planTransfer('alice.k', to, { sweep: false })
 const plan = await registrar.planRelease('alice.k')
 
 // plan.fromDeed   'kaspa:pq6ekafa…'
-// plan.fee          5_170_200n   0.0517 KAS, the largest of these transactions
-// plan.returned   194_829_800n   1.948 KAS, the bond and the gap value, less the fee
+// plan.fee          4_924_000n   0.0492 KAS, the largest of these transactions
+// plan.returned   195_076_000n   1.951 KAS, the bond and the gap value, less the fee
 
 const txid = await registrar.submit(plan)
 // the user signs here: the deed at input 1, and the coin at input 3</pre>
@@ -443,8 +444,8 @@ const txid = await registrar.submit(plan)
 const plan = await registrar.planSweep() // one name: planSweep('alice.k')
 
 // plan.cards  2
-// plan.value  99_477_520n   what the cards hold, less the fee
-// plan.fee       522_480n
+// plan.value  99_502_400n   what the cards hold, less the fee
+// plan.fee       497_600n
 
 const txid = await registrar.submit(plan)
 // the user signs here: both cards, inputs 0 and 1. Nothing else is in the transaction.</pre>
@@ -527,6 +528,10 @@ try {
         <tr>
           <td><code>SigningError</code></td>
           <td>the wallet's answer is not one this package can use</td>
+        </tr>
+        <tr>
+          <td><code>CommitNotMinedError</code></td>
+          <td>a registration's commit was sent but not mined in time, so the reveal was not sent</td>
         </tr>
         <tr>
           <td><code>SubmitError</code></td>
