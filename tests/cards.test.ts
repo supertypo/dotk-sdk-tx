@@ -20,8 +20,9 @@ import type { SpendableUtxo } from '../src/ports.js'
 import { ecdsaSighash, schnorrSighash, transactionId } from '../src/sighash.js'
 import { transferIntent, type Deed } from '../src/transfer.js'
 import { emptyTx, toSafeJson } from '../src/tx.js'
+import { requiredFee } from '../src/mass.js'
 import { encodeRequest } from '../src/wrpc.js'
-import { vectors } from './vectors.js'
+import { readyMassOf, vectors } from './vectors.js'
 
 const dotk = new Dotk({ api: null, network: 'testnet-10' })
 const registry = dotk.protocol
@@ -86,6 +87,7 @@ function rebuild(c: Case) {
       funding: coins,
       changeScriptPublicKey: c.changeSpk,
       feerate: c.feerate,
+      readyMass: readyMassOf(c),
       requiredFunding: 0n,
       signedInputs: plan.cardInputs,
     }),
@@ -229,6 +231,14 @@ describe('the merge under a JS caller', () => {
 describe('a standalone sweep', () => {
   const c = vectors.cardAssembly.find((v) => v.cards.sweep.length > 0)!
   const sweep = () => planOf(c).sweep
+
+  it('pays exactly what its own transaction requires, at the floor and when blocks are full', () => {
+    for (const rate of [0, 100, 777.77]) {
+      const swept = assembleSweep(sweep(), c.changeSpk, rate)
+      expect(swept.fee).toBe(requiredFee(swept.tx, rate))
+      expect(requiredFee(swept.tx, rate)).toBeGreaterThan(swept.fee - 1n)
+    }
+  })
 
   it('pays the cards to the destination less the fee, signed by the cards alone', () => {
     const swept = assembleSweep(sweep(), c.changeSpk, 1)

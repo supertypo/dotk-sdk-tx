@@ -308,13 +308,16 @@ take to open, and how long each call can take.
 A node must start with `--rpclisten-json` to serve that encoding. The Borsh port most wallets use
 will not answer it.
 
-To write your own node client instead, implement three methods:
+To write your own node client instead, implement three methods. Add the optional
+`readyMass()` to price by the node's ready mempool mass, as the fee rules above describe. Without
+it, the fee is the feerate on the fee mass.
 
 ```ts
 interface TxNode {
   utxosOf(address: string): Promise<SpendableUtxo[]>
   feerate(): Promise<number>
   submit(tx: Tx): Promise<string>
+  readyMass?(): Promise<bigint | null>
 }
 ```
 
@@ -382,14 +385,28 @@ the wallet afresh.
 
 ## What it costs
 
-`plan.fee` is the network fee in sompi. This package computes it the way the mempool prices a
-transaction. It takes the larger of the compute mass and the normalized transient mass, at the
-node's feerate. It floors that at the relay minimum and carries a 5% margin for signature-size
-drift. A transfer moves nothing else, so the fee is the whole cost. With cards,
+`plan.fee` is the network fee in sompi, and it carries no margin. The relay floor is 100 sompi
+per gram of the fee mass, the larger of the compute mass and the normalized transient mass. The
+node reports its ready mempool mass through `getFeeEstimateExperimental`, and the fee depends on
+it:
+
+- While the ready mempool fits in one block, the node takes every transaction, so the fee is the
+  relay floor.
+- Once it overflows a block, the node ranks by the largest of compute, normalized transient and
+  storage mass. The fee is the node's normal-priority feerate on that mass, where that is more
+  than the floor.
+- Where the node does not report it, the fee is the feerate on the fee mass, where that is more
+  than the floor.
+
+A transfer moves nothing else, so the fee is the whole cost. With cards,
 `plan.cards.value` is the rest, and you can recover it.
 
+`assemble` pays at most `OVERPAY_CEILING_SOMPI`, 0.08 KAS, above what its own transaction requires.
+That excess is change folded into the fee. A coin whose change cannot pay for its own storage mass
+at the rate is refused, and another coin is the remedy.
+
 `FeeCeilingError` means the fee came out above 5 KAS. That 5 KAS is a rail and never a setting,
-because the estimate the fee derives from arrives unvalidated from a node the user did not pick.
+because the feerate the fee derives from arrives unvalidated from a node the user did not pick.
 `InsufficientFundingError` names the shortfall.
 
 A release frees the bond and a gap value, which is more than its fee, so the wallet's part is one
@@ -404,9 +421,8 @@ to `FOLD_CEILING_SOMPI`, about 0.04 KAS, and `fee` shows it. So the error names 
 cannot mend: many inputs, several small outputs at once, or change past that ceiling. Another coin is the remedy, and the caller chooses it. This package selects
 largest-first and does not widen the selection on its own.
 
-Storage mass is priced into the mempool's ranking when the mempool is full, and not into the
-relay floor the fee above clears. A refusal on that ground is `transient`, and the same bytes can
-be sent again.
+The relay floor leaves storage mass out, and a node admits a transaction on the floor alone. A
+refusal on the ranking is `transient`, and the same bytes can be sent again.
 
 ## When the node refuses
 

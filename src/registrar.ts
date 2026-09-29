@@ -34,7 +34,7 @@ import {
   refuseUnreachableSubnames,
 } from './records.js'
 import { assembleSweep, cardMint, type CardPlan, type CardSweep } from './cards.js'
-import { COINBASE_MATURITY } from './mass.js'
+import { COINBASE_MATURITY, fullBlockHeadroom } from './mass.js'
 import { transactionId } from './sighash.js'
 
 import { CommitNotMinedError, NodeError, SubmitError, TxError, UndecodableCardError } from './errors.js'
@@ -611,8 +611,18 @@ export class Registrar {
     }
   }
 
-  private async feerate(options?: NodeCallOptions): Promise<number> {
-    return this.asked('node', options, (signal) => this.node.feerate(signal ? { signal } : undefined))
+  /** The feerate, and the ready mass where the node reports it. */
+  private async market(options?: NodeCallOptions): Promise<{ feerate: number; readyMass: bigint | null }> {
+    const call = (signal: AbortSignal | undefined) => (signal ? { signal } : undefined)
+    const feerate = await this.asked('node', options, (signal) => this.node.feerate(call(signal)))
+    let readyMass: bigint | null = null
+    try {
+      readyMass = (await this.node.readyMass?.(call(options?.signal))) ?? null
+    } catch (e) {
+      // A node that cannot say prices on fee mass, and only a cancel stops the operation.
+      if (options?.signal?.aborted) throw e
+    }
+    return { feerate, readyMass }
   }
 
   /**
@@ -707,11 +717,12 @@ export class Registrar {
     const plan = transferIntent(registry, registry.deedAbi, deed, target.ownerType, toHex(target.owner), cards)
 
     const funding = await this.spendable(options)
-    const feerate = await this.feerate(options)
+    const { feerate, readyMass } = await this.market(options)
     const assembled = assemble(plan.base, {
       funding,
       changeScriptPublicKey: toHex(scriptPublicKeyOf(this.account.address, this.dotk)),
       feerate,
+      readyMass,
       requiredFunding: 0n,
       signedInputs: plan.cardInputs,
     })
@@ -768,10 +779,10 @@ export class Registrar {
     const owner = this.account
     const split = splitIntent(registry, gap, bare, owner.ownerType, owner.owner)
 
-    const feerate = await this.feerate(options)
+    const { feerate, readyMass } = await this.market(options)
     const changeSpk = toHex(scriptPublicKeyOf(this.account.address, this.dotk))
     const tier = BigInt(feeForName(registry.params, bare))
-    const buffer = options?.buffer ?? DEFAULT_REGISTRATION_BUFFER
+    const buffer = (options?.buffer ?? DEFAULT_REGISTRATION_BUFFER) + fullBlockHeadroom(feerate, readyMass)
     // Sized so the commit's change clears the reveal's own floor and not sized to be exact. An
     // exact target lands the remainder in the band a node refuses, and this package does not
     // widen a selection the caller handed it.
@@ -783,6 +794,7 @@ export class Registrar {
       funding: await this.spendable(options),
       changeScriptPublicKey: changeSpk,
       feerate,
+      readyMass,
       requiredFunding: target,
     })
     const change = commit.changeIndex
@@ -816,6 +828,7 @@ export class Registrar {
       ],
       changeScriptPublicKey: changeSpk,
       feerate,
+      readyMass,
       requiredFunding: activate.requiredFunding,
     })
 
@@ -1016,11 +1029,12 @@ export class Registrar {
     }
     const activate = activateIntent(registry, pending, bare, owner.ownerType, owner.owner)
     const funding = await this.spendable(options)
-    const feerate = await this.feerate(options)
+    const { feerate, readyMass } = await this.market(options)
     const assembled = assemble(activate.base, {
       funding,
       changeScriptPublicKey: toHex(scriptPublicKeyOf(this.account.address, this.dotk)),
       feerate,
+      readyMass,
       requiredFunding: activate.requiredFunding,
     })
     return {
@@ -1064,11 +1078,12 @@ export class Registrar {
     const plan = releaseIntent(registry, deed, pred, succ)
 
     const funding = await this.spendable(options)
-    const feerate = await this.feerate(options)
+    const { feerate, readyMass } = await this.market(options)
     const assembled = assemble(plan.base, {
       funding,
       changeScriptPublicKey: toHex(scriptPublicKeyOf(this.account.address, this.dotk)),
       feerate,
+      readyMass,
       requiredFunding: 0n,
     })
     return {
@@ -1183,10 +1198,12 @@ export class Registrar {
         'no card of this account is left at the node to sweep. Without an api none is listed, and one this registrar already swept is not offered again'
       )
     }
+    const { feerate, readyMass } = await this.market(options)
     const assembled = assembleSweep(
       cards,
       toHex(scriptPublicKeyOf(this.account.address, this.dotk)),
-      await this.feerate(options)
+      feerate,
+      readyMass
     )
     const ownerSigInputs = cards.map((_, at) => at)
     return {

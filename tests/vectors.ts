@@ -29,6 +29,7 @@ export interface Vectors {
     fundingSpk: string
     changeSpk: string
     feerate: number
+    readyMass?: number
     splitSigScript: string
     splitOutputs: [number, string][]
     splitRequiredFunding: number
@@ -52,6 +53,7 @@ export interface Vectors {
     fundingSpk: string
     changeSpk: string
     feerate: number
+    readyMass?: number
     sigScripts: string[]
     mergedSpk: string
     size: number
@@ -82,6 +84,7 @@ export interface Vectors {
     fundingSpk: string
     changeSpk: string
     feerate: number
+    readyMass?: number
     size: number
     computeMass: number
     transientMass: number
@@ -148,4 +151,9 @@ for (const network of committed) {
         `Rerun the generator in the parent workspace`
     )
   }
+}
+
+/** A case's ready mempool mass as the assemblers take it, absent where the case names none. */
+export function readyMassOf(c: { readyMass?: number | undefined }): bigint | undefined {
+  return c.readyMass === undefined ? undefined : BigInt(c.readyMass)
 }

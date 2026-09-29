@@ -4,6 +4,19 @@ The record starts at 1.2.0.
 
 ## 2.1.0
 
+- A fee carries no margin. It pays exactly what the node requires, about 4.8% less than before.
+- `TxNode` gains the optional `readyMass()`, the node's ready mempool mass, or `null` where the
+  node does not report it. The two adapters read it through `getFeeEstimateExperimental`.
+  `AssembleOptions.readyMass`, a fourth argument to `assembleSweep` and a third argument to
+  `requiredFee` take it. `frontierMass` is a new export.
+- With a ready mass within one block, the fee is exactly the relay floor. Past one block, it is the
+  node's feerate on the mass the mempool ranks by, which counts storage mass. Without a ready mass,
+  the fee is the feerate on the fee mass, as before.
+- `assemble` pays at most `OVERPAY_CEILING_SOMPI`, 0.08 KAS, above what its own transaction
+  requires. That excess is change folded into the fee. A coin whose change cannot pay for its own
+  storage mass at the rate is refused, and another coin is the remedy.
+- A sweep settles its fee over several passes, because its output's value can move its storage
+  mass.
 - `register` sends the reveal only once the node shows the commit mined. The reveal publishes the
   name. While the commit is unmined, anyone who reads the name can race a commit of their own for
   the same gap. So `register` takes at least one block. The wait asks the node every

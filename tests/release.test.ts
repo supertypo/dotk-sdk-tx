@@ -6,7 +6,7 @@ import { releaseIntent, type Gap } from '../src/release.js'
 import { ecdsaSighash, schnorrSighash } from '../src/sighash.js'
 import type { Deed } from '../src/transfer.js'
 import { toSafeJson } from '../src/tx.js'
-import { vectors } from './vectors.js'
+import { readyMassOf, vectors } from './vectors.js'
 
 const registry = new Dotk({ api: null, network: 'testnet-10' }).protocol
 
@@ -74,6 +74,7 @@ describe('the exit merge agrees with the corpus', () => {
       })),
       changeScriptPublicKey: c.changeSpk,
       feerate: c.feerate,
+      readyMass: readyMassOf(c),
       requiredFunding: 0n,
     })
     expect(assembled.mass.compute).toBe(BigInt(c.computeMass))
@@ -131,7 +132,12 @@ describe('a release from a wallet that cannot cover the fee', () => {
     blockDaaScore: 0n,
     isCoinbase: false,
   }
-  const options = { changeScriptPublicKey: c.changeSpk, feerate: c.feerate, requiredFunding: 0n }
+  const options = {
+    changeScriptPublicKey: c.changeSpk,
+    feerate: c.feerate,
+    readyMass: readyMassOf(c),
+    requiredFunding: 0n,
+  }
 
   it('refuses an empty wallet, and says that any coin will do', () => {
     const e = (() => {

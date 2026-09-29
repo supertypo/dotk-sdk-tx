@@ -178,6 +178,20 @@ function nodeHoldingAlso(name: string, over: Parameters<typeof fakeNode>[0] = {}
 }
 
 describe('planning a transfer', () => {
+  it('prices in the ready mass of a node that reports it, and on fee mass where it does not', async () => {
+    const priced = async (readyMass?: bigint | null) => {
+      const node = { ...fakeNode(), feerate: async () => 700 }
+      const withMass = readyMass === undefined ? node : { ...node, readyMass: async () => readyMass }
+      return (await registrarWith(withMass).registrar.planTransfer(NAME, recipient)).fee
+    }
+    const legacy = await priced()
+    expect(await priced(null)).toBe(legacy)
+    const failing = { ...fakeNode(), feerate: async () => 700, readyMass: () => Promise.reject(new Error('gone')) }
+    expect((await registrarWith(failing).registrar.planTransfer(NAME, recipient)).fee).toBe(legacy)
+    expect(await priced(500_001n)).toBeGreaterThan(legacy)
+    expect(await priced(500_000n)).toBeLessThan(legacy)
+  })
+
   it('names the recipient the caller gave, alongside where the deed moves', async () => {
     const { registrar } = registrarWith(fakeNode())
     const plan = await registrar.planTransfer(NAME, recipient)

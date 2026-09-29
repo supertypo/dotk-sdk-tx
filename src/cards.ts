@@ -16,7 +16,7 @@ import {
   sweepSigScript,
   toHex,
 } from '@dotk/sdk'
-import { FUNDING_COMPUTE_BUDGET, MAX_FEE_SOMPI, MIN_OUTPUT_VALUE, type Assembled } from './assemble.js'
+import { FEE_PASSES, FUNDING_COMPUTE_BUDGET, MAX_FEE_SOMPI, MIN_OUTPUT_VALUE, type Assembled } from './assemble.js'
 import { FeeCeilingError, InsufficientFundingError, MassCeilingError, TxError } from './errors.js'
 import { bytesOf } from './hex.js'
 import { massOverrun, massesOf, requiredFee } from './mass.js'
@@ -108,10 +108,16 @@ export function withCards(base: Tx, plan: CardPlan): { tx: Tx; cardInputs: numbe
  * A standalone sweep: the cards alone, which pay `destScriptPublicKey` what they hold less the
  * fee. No covenant takes part, and the cards' own signatures commit to the one output.
  *
- * One pass settles the fee, because every input already carries a script of its final length and
- * the one output is the same size whatever it holds.
+ * Every input already carries a script of its final length, so compute mass is settled. The one
+ * output's value can move its storage mass, so the fee takes the cheapest pass that covers its own
+ * transaction.
  */
-export function assembleSweep(sweep: CardSweep[], destScriptPublicKey: string, feerate: number): Assembled {
+export function assembleSweep(
+  sweep: CardSweep[],
+  destScriptPublicKey: string,
+  feerate: number,
+  readyMass?: bigint | null
+): Assembled {
   if (sweep.length === 0) throw new TxError('a sweep needs a card to sweep')
   bytesOf(destScriptPublicKey, 'destination script')
   const total = sweep.reduce((n, c) => n + c.value, 0n)
@@ -120,11 +126,21 @@ export function assembleSweep(sweep: CardSweep[], destScriptPublicKey: string, f
     inputs: sweep.map(cardInput),
     outputs: [{ value: total, scriptPublicKey: destScriptPublicKey, scriptVersion: 0 }],
   }
-  const fee = requiredFee(shape, feerate)
-  if (fee > MAX_FEE_SOMPI) throw new FeeCeilingError(fee, MAX_FEE_SOMPI)
-  // The one output clears the same floor every protocol output clears.
-  if (total < fee + MIN_OUTPUT_VALUE) throw new InsufficientFundingError(total, fee + MIN_OUTPUT_VALUE)
-  const tx: Tx = { ...shape, outputs: [{ ...shape.outputs[0]!, value: total - fee }] }
+  const paying = (fee: bigint): Tx => ({ ...shape, outputs: [{ ...shape.outputs[0]!, value: total - fee }] })
+  let fee = requiredFee(shape, feerate, readyMass)
+  let cheapest: bigint | undefined
+  for (let pass = 0; pass < FEE_PASSES; pass++) {
+    if (fee > MAX_FEE_SOMPI) throw new FeeCeilingError(fee, MAX_FEE_SOMPI)
+    // The one output clears the same floor every protocol output clears.
+    if (total < fee + MIN_OUTPUT_VALUE) throw new InsufficientFundingError(total, fee + MIN_OUTPUT_VALUE)
+    const next = requiredFee(paying(fee), feerate, readyMass)
+    if (fee >= next && (cheapest === undefined || fee < cheapest)) cheapest = fee
+    if (fee === next) break
+    fee = next
+  }
+  if (cheapest === undefined) throw new TxError('the fee did not settle: the sweep changed mass on every pass')
+  fee = cheapest
+  const tx = paying(fee)
   // The same rail `assemble` applies: a sweep of many cards is many inputs, and the compute cap
   // is what bounds them.
   const overrun = massOverrun(tx)

@@ -14,7 +14,7 @@ import { type Tx, type TxInput, utxoEntryOf } from './tx.js'
 /**
  * The most this package will build a transaction to pay, in sompi. A constant, never a setting.
  *
- * The feerate estimate is unvalidated and arrives from a node the user did not choose. A
+ * The feerate is unvalidated and arrives from a node the user did not choose. A
  * SIGHASH_ALL signature commits to the fee. Coin selection takes the largest coin first. Without
  * a ceiling the exposure is that coin, not a fee budget.
  */
@@ -47,8 +47,15 @@ export const FUNDING_COMPUTE_BUDGET = 20
 /** A funding signature script: one canonical push of a 65-byte signature. */
 export const FUNDING_SIG_SCRIPT_LEN = 66
 
+/**
+ * The most a transaction pays above its own requirement, in sompi. That excess is change folded
+ * into the fee, with the price of the change output the fold removed. Past it the transaction is
+ * refused, because another coin keeps the change.
+ */
+export const OVERPAY_CEILING_SOMPI = 2n * FOLD_CEILING_SOMPI
+
 /** How many passes the fee can take before this module calls the loop broken. */
-const FEE_PASSES = 5
+export const FEE_PASSES = 64
 
 export interface AssembleOptions {
   /** Coins to draw on. Selection takes the largest first, which is what bounds the count of inputs. */
@@ -58,6 +65,11 @@ export interface AssembleOptions {
   changeScriptVersion?: number | undefined
   /** Sompi per gram, from the node. */
   feerate: number
+  /**
+   * The node's ready mempool mass, from `TxNode.readyMass()`. Absent or `null`, the fee is the
+   * feerate on the fee mass. `requiredFee` says what each case pays.
+   */
+  readyMass?: bigint | null | undefined
   /** What the protocol outputs need beyond what the protocol inputs already hold. */
   requiredFunding: bigint
   /**
@@ -124,7 +136,7 @@ function seedFee(base: Tx, options: AssembleOptions): bigint {
     isCoinbase: false,
   }
   const probe: Tx = { ...base, inputs: [...base.inputs, fundingInput(stand, '')] }
-  return requiredFee(measuredClone(probe, [base.inputs.length]), options.feerate)
+  return requiredFee(measuredClone(probe, [base.inputs.length]), options.feerate, options.readyMass)
 }
 
 /**
@@ -205,13 +217,15 @@ export function build(base: Tx, picked: SpendableUtxo[], options: AssembleOption
 }
 
 /**
- * Assemble with the fee the node's feerate implies.
+ * Assemble with the fee that `requiredFee` sets at `options.feerate` and `options.readyMass`.
  *
  * It iterates because the fee decides the change output, that output's value decides the mass,
  * and the mass decides the fee. Near the dust threshold the output's existence decides the mass.
  *
- * It settles on the first pass that pays at least what its own shape requires. Near the threshold
- * there is no fixed point to settle on: adding a change output raises the fee enough to make the
+ * A higher fee leaves less change, and small change adds storage mass, so the fee climbs until a
+ * pass requires exactly the fee it was built with. A pass counts where it pays at most
+ * `OVERPAY_CEILING_SOMPI` above its own requirement, and the cheapest such pass wins. Near the
+ * dust threshold there is no fixed point: adding a change output raises the fee enough to make the
  * change dust, and dropping one lowers the fee enough to bring the change back.
  */
 export function assemble(base: Tx, options: AssembleOptions): Assembled {
@@ -240,29 +254,62 @@ export function assemble(base: Tx, options: AssembleOptions): Assembled {
 
   const settle = (funding: (fee: bigint) => SpendableUtxo[]): Assembled => {
     let fee = 0n
-    let assembled = build(base, funding(seed), options, fee)
-    for (let pass = 0; pass < FEE_PASSES; pass++) {
-      const next = requiredFee(measuredClone(assembled.tx, assembled.fundingInputs), options.feerate)
-      if (assembled.fee >= next) {
-        // Measured on the settled transaction and never on a pass inside the loop. The first pass
-        // carries the whole funding as change, so refusing on one refuses fundings that converge.
-        const overrun = massOverrun(measuredClone(assembled.tx, assembled.fundingInputs))
-        if (overrun) throw new MassCeilingError(overrun.dimension, overrun.mass, overrun.cap)
-        return assembled
+    let cheapest: Assembled | undefined
+    let remainder: bigint | undefined
+    let folded = false
+    let failure: InsufficientFundingError | FeeCeilingError | undefined
+    let failedAt = 0n
+    let leastNext: bigint | undefined
+    // Selection follows the highest fee a built pass asked for, so a coin that joined stays while
+    // the fee settles back on the larger set.
+    let highest = 0n
+    const tried = new Set<bigint>()
+    let selection = funding(seed)
+    for (let pass = 0; pass < FEE_PASSES && !tried.has(fee); pass++) {
+      tried.add(fee)
+      let assembled: Assembled
+      try {
+        if (pass > 0) selection = funding(fee > highest ? fee : highest)
+        assembled = build(base, selection, options, fee)
+        if (fee > highest) highest = fee
+      } catch (e) {
+        if (!(e instanceof InsufficientFundingError || e instanceof FeeCeilingError)) throw e
+        failure = e
+        failedAt = fee
+        // The one pass that can still cover: all of the change folded into the fee.
+        if (remainder !== undefined && !folded && remainder < fee) {
+          folded = true
+          fee = remainder
+          continue
+        }
+        break
       }
-      // Before the selection runs against it. Reported as a shortfall, a fee over the ceiling names
-      // the wallet's balance as the problem instead.
-      if (next > MAX_FEE_SOMPI) throw new FeeCeilingError(next, MAX_FEE_SOMPI)
+      const change = assembled.changeIndex >= 0 ? assembled.tx.outputs[assembled.changeIndex]!.value : 0n
+      remainder = assembled.fee + change
+      const next = requiredFee(measuredClone(assembled.tx, assembled.fundingInputs), options.feerate, options.readyMass)
+      if (leastNext === undefined || next < leastNext) leastNext = next
+      const covers = assembled.fee >= next && assembled.fee - next <= OVERPAY_CEILING_SOMPI
+      if (covers && (cheapest === undefined || assembled.fee < cheapest.fee)) cheapest = assembled
+      if (fee === next) break
       fee = next
-      assembled = build(base, funding(fee), options, fee)
     }
-    throw new TxError('the fee did not settle: the transaction changed size on every pass')
+    if (cheapest === undefined) {
+      // The climb ran past every requirement a built pass had, so the change is what failed.
+      const runaway = leastNext !== undefined && failedAt > leastNext + OVERPAY_CEILING_SOMPI
+      if (failure !== undefined && !runaway) throw failure
+      throw new TxError('at this feerate the change cannot pay for its own storage mass: add a coin')
+    }
+    // Measured on the settled transaction and never on a pass inside the loop. The first pass
+    // carries the whole funding as change, so refusing on one refuses fundings that converge.
+    const overrun = massOverrun(measuredClone(cheapest.tx, cheapest.fundingInputs))
+    if (overrun) throw new MassCeilingError(overrun.dimension, overrun.mass, overrun.cap)
+    return cheapest
   }
 
   // What the seats free beyond what they post, which a release does by its bond and a gap
   // value, pays before the wallet does. The wallet owes the rest, largest coin first. Where it
   // owes nothing, its part is one coin of any size, which signs the change output, or none where
-  // a signed input already does. What is owed grows with the fee alone, so a set only ever grows.
+  // a signed input already does. What is owed grows with the fee alone.
   const surplus = protocolIn > protocolOut ? protocolIn - protocolOut : 0n
   const largest = options.funding.reduce<SpendableUtxo | undefined>(
     (best, u) => (best === undefined || u.amount > best.amount ? u : best),

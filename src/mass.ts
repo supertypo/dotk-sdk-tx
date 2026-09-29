@@ -2,10 +2,10 @@
 // and raises no error. Each one carries the name of the consensus constant it mirrors, and the
 // corpus in `tests/` replays the reference implementation's answers.
 //
-// Storage mass is here too and is not part of the fee. KIP-9 prices it contextually, over the
-// values a transaction consumes and creates. A node refuses a transaction over the limit without
-// charging more for it. This package models storage mass because the refusal is otherwise
-// invisible until the node makes it, by which time a wallet already prompted its user.
+// Storage mass is here too. KIP-9 prices it contextually, over the values a transaction consumes
+// and creates. The relay floor ignores it, but the mempool ranks a transaction by it, so it prices
+// the fee while the ready mempool overflows one block. A node also refuses a transaction over the
+// limit, and that refusal is otherwise invisible until the node makes it.
 
 import { hexLen, type Tx } from './tx.js'
 
@@ -35,9 +35,6 @@ export const COINBASE_MATURITY = 1000n
 
 /** `MINIMUM_RELAY_FEE_SOMPI_PER_KG`: the floor a transaction pays to be relayed at all. */
 const MINIMUM_RELAY_FEE_SOMPI_PER_KG = 100_000n
-/** The margin every fee carries. It absorbs signature-script size drift. */
-const FEE_MARGIN_NUMERATOR = 105n
-const FEE_MARGIN_DENOMINATOR = 100n
 
 const HASH_SIZE = 32n
 const SUBNETWORK_ID_SIZE = 20n
@@ -86,12 +83,8 @@ export function massesOf(tx: Tx): Masses {
   return { size, compute, transient, fee: compute > normalized ? compute : normalized }
 }
 
-function ceilDiv(a: bigint, b: bigint): bigint {
-  return (a + b - 1n) / b
-}
-
 /**
- * The relay minimum for a transaction of this mass. The per-kilogram rate stands in where the
+ * The relay floor for a transaction of this mass. The per-kilogram rate stands in where the
  * division rounds the fee away entirely, which the mempool otherwise prices at nothing.
  */
 export function relayMinimumFee(feeMass: bigint): bigint {
@@ -99,23 +92,58 @@ export function relayMinimumFee(feeMass: bigint): bigint {
   return fee === 0n ? MINIMUM_RELAY_FEE_SOMPI_PER_KG : fee
 }
 
+/** The mass a registration's two halves rank by in a full block, with room for the change. */
+const REGISTRATION_FULL_BLOCK_GRAMS = 150_000
+
 /**
- * What this transaction must pay at the node's current feerate, in sompi.
- *
- * The estimate arrives unvalidated from a node the caller did not necessarily choose, so a
- * negative or non-finite one reads as zero and the relay minimum decides. The ceiling in
- * `assemble` is what bounds the answer from above.
+ * Headroom a registration's funding takes beyond its fixed buffer while blocks are full, so the
+ * commit's change still pays for the reveal. What the fees do not take returns as change.
  */
-export function requiredFee(tx: Tx, feerateSompiPerGram: number): bigint {
+export function fullBlockHeadroom(feerate: number, readyMass: bigint | null | undefined): bigint {
+  const full = typeof readyMass === 'bigint' && readyMass > MASS_LIMITS.compute
+  if (!full || !Number.isFinite(feerate) || feerate <= 0) return 0n
+  const headroom = BigInt(Math.ceil(feerate * REGISTRATION_FULL_BLOCK_GRAMS))
+  return headroom < 500_000_000n ? headroom : 500_000_000n
+}
+
+/**
+ * The mass the mempool ranks a transaction by and quotes its estimates in: the largest of its
+ * compute, normalized transient and storage masses. Storage normalizes at one, because its block
+ * limit equals the compute limit. It is `null` where storage mass has no answer.
+ */
+export function frontierMass(tx: Tx): bigint | null {
+  const storage = storageMassOf(tx)
+  if (storage === null) return null
+  const { fee } = massesOf(tx)
+  return storage > fee ? storage : fee
+}
+
+/**
+ * What this transaction must pay, in sompi, at the node's feerate. `readyMass` is the node's ready
+ * mempool mass. Within one block the node takes every transaction, so the fee is the relay floor.
+ * Past one block the node ranks by {@link frontierMass}, and the fee is the feerate on that mass
+ * where that is more than the floor. Where `readyMass` is absent or `null`, the fee is the feerate
+ * on the fee mass where that is more.
+ *
+ * A negative or non-finite rate reads as zero, and so does a ready mass that is not a count. A transaction with no storage answer is priced on its
+ * other masses, and `massOverrun` refuses it. The ceiling in `assemble` bounds the answer from
+ * above.
+ */
+export function requiredFee(tx: Tx, feerate: number, readyMass?: bigint | null): bigint {
   const { fee: feeMass } = massesOf(tx)
-  const rate = Number.isFinite(feerateSompiPerGram) ? Math.max(feerateSompiPerGram, 0) : 0
-  const product = Math.ceil(Number(feeMass) * rate)
+  const floor = relayMinimumFee(feeMass)
+  const rate = Number.isFinite(feerate) ? Math.max(feerate, 0) : 0
+  if (rate === 0) return floor
+  let mass = feeMass
+  if (typeof readyMass === 'bigint' && readyMass >= 0n) {
+    if (readyMass <= MASS_LIMITS.compute) return floor
+    mass = frontierMass(tx) ?? feeMass
+  }
+  const product = Math.ceil(Number(mass) * rate)
   // A rate large enough to overflow the product is one the ceiling in `assemble` refuses, and
   // that is the refusal worth reading. `BigInt(Infinity)` raises a RangeError instead.
   const market = Number.isFinite(product) ? BigInt(product) : BigInt(Number.MAX_SAFE_INTEGER)
-  const floor = relayMinimumFee(feeMass)
-  const chosen = market > floor ? market : floor
-  return ceilDiv(chosen * FEE_MARGIN_NUMERATOR, FEE_MARGIN_DENOMINATOR)
+  return market > floor ? market : floor
 }
 
 /**

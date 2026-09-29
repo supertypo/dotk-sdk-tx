@@ -1,14 +1,22 @@
 import { Dotk, OwnerType, SubnameError, encodeActiveDeedState, fromHex, hex32, toHex } from '@dotk/sdk'
 import { describe, expect, it } from 'vitest'
-import { assemble, build, DUST_SOMPI, FOLD_CEILING_SOMPI, MAX_FEE_SOMPI } from '../src/assemble.js'
+import {
+  assemble,
+  build,
+  DUST_SOMPI,
+  FOLD_CEILING_SOMPI,
+  MAX_FEE_SOMPI,
+  measuredClone,
+  OVERPAY_CEILING_SOMPI,
+} from '../src/assemble.js'
 import { FeeCeilingError, InsufficientFundingError, MassCeilingError, TxError } from '../src/errors.js'
 
 import type { SpendableUtxo } from '../src/ports.js'
 import { ecdsaSighash, schnorrSighash, transactionId } from '../src/sighash.js'
 import { transferIntent, type Deed } from '../src/transfer.js'
-import { requiredFee } from '../src/mass.js'
+import { frontierMass, fullBlockHeadroom, massesOf, relayMinimumFee, requiredFee } from '../src/mass.js'
 import { emptyTx, toSafeJson } from '../src/tx.js'
-import { vectors } from './vectors.js'
+import { readyMassOf, vectors } from './vectors.js'
 
 const dotk = new Dotk({ api: null, network: 'testnet-10' })
 const registry = dotk.protocol
@@ -54,6 +62,7 @@ describe('the assembled transfer', () => {
       fundingSpk,
       changeSpk,
       feerate,
+      readyMass,
       size,
       computeMass,
       transientMass,
@@ -76,6 +85,7 @@ describe('the assembled transfer', () => {
         funding: coins,
         changeScriptPublicKey: changeSpk,
         feerate,
+        readyMass: readyMassOf({ readyMass }),
         requiredFunding: 0n,
       })
 
@@ -287,14 +297,16 @@ describe('what assembly refuses', () => {
    * There is no exact fee anywhere in this band: adding the change output raises the fee enough
    * to make the change dust, and dropping it lowers the fee enough to bring the change back.
    * A loop hunting a fixed point leaves the whole band untransferable, and says so with a
-   * message about the transaction rather than about the funding.
+   * message about the transaction rather than about the funding. The relay floor prices it, so the
+   * fee is independent of the coin's size. Above the floor storage mass prices the fee, and the
+   * coin's size moves it.
    */
   it('settles anywhere in the band where the leftover is worth less than dust', () => {
     const at = (funding: bigint) =>
       assemble(plan0().base, {
         funding: [coin(funding)],
         changeScriptPublicKey: case0.changeSpk,
-        feerate: 1000,
+        feerate: 0,
         requiredFunding: 0n,
       })
     const floor = at(100_000_000_000n).fee
@@ -404,6 +416,7 @@ describe('what the node and the wallet are handed', () => {
       funding: coins,
       changeScriptPublicKey: c.changeSpk,
       feerate: c.feerate,
+      readyMass: readyMassOf(c),
       requiredFunding: 0n,
     })
   }
@@ -442,6 +455,101 @@ describe('destinations this package refuses', () => {
 
   it('still accepts the key-owned schemes', () => {
     expect(() => to(case0.newOwnerType, case0.newOwner)).not.toThrow()
+  })
+})
+
+describe('the fee rules', () => {
+  const c = vectors.transferAssembly[0]!
+  const deed = deedOf(c.name, c.ownerType, c.owner, c.deedOutpoint[0], c.deedOutpoint[1])
+  const FULL = 500_001n
+  const build = (value: bigint, feerate: number, readyMass?: bigint | null) =>
+    assemble(transferIntent(registry, registry.deedAbi, deed, c.newOwnerType, c.newOwner).base, {
+      funding: [coin(value)],
+      changeScriptPublicKey: c.changeSpk,
+      feerate,
+      readyMass,
+      requiredFunding: 0n,
+    })
+  const at = (feerate: number, readyMass?: bigint | null) => build(100_000_000_000n, feerate, readyMass)
+  const measured = (a: ReturnType<typeof at>) => measuredClone(a.tx, a.fundingInputs)
+  function coin(value: bigint): SpendableUtxo {
+    return {
+      outpoint: { transactionId: 'bb'.repeat(32), index: 1 },
+      amount: value,
+      scriptPublicKey: c.fundingSpk,
+      scriptVersion: 0,
+      blockDaaScore: 0n,
+      isCoinbase: false,
+    }
+  }
+
+  it('pays exactly the relay floor while blocks have room', () => {
+    const a = at(700, 500_000n)
+    expect(a.fee).toBe(relayMinimumFee(massesOf(measured(a)).fee))
+  })
+
+  it('pays the rate on the frontier mass when blocks are full, and one sompi less ranks below it', () => {
+    const a = at(700, FULL)
+    const mass = frontierMass(measured(a))!
+    expect(mass).toBeGreaterThan(massesOf(measured(a)).fee)
+    expect(a.fee).toBe(BigInt(Math.ceil(Number(mass) * 700)))
+    expect(Number(a.fee - 1n) / Number(mass)).toBeLessThan(700)
+  })
+
+  it('pays the rate on the fee mass where the ready mass is unknown', () => {
+    for (const unknown of [undefined, null]) {
+      const a = at(700, unknown)
+      expect(a.fee).toBe(BigInt(Math.ceil(Number(massesOf(measured(a)).fee) * 700)))
+    }
+    expect(at(100).fee).toBe(relayMinimumFee(massesOf(measured(at(100))).fee))
+    const legacy = at(700).fee
+    expect(requiredFee(measured(at(700)), 700, -1n)).toBe(legacy)
+  })
+
+  it('never pays more than the overpay ceiling above what its own transaction needs', () => {
+    for (const [rate, ready] of [
+      [100, FULL],
+      [500, FULL],
+      [1234.5, FULL],
+      [500, null],
+      [900, 0n],
+    ] as const) {
+      let built = 0
+      for (let step = 0n; step < 300n; step++) {
+        let a: ReturnType<typeof at>
+        try {
+          a = build(2_000_000n + step * 997_331n, rate, ready)
+        } catch (e) {
+          expect(e).toSatisfy(
+            (x) => x instanceof InsufficientFundingError || x instanceof MassCeilingError || x instanceof TxError
+          )
+          continue
+        }
+        built++
+        const need = requiredFee(measured(a), rate, ready)
+        expect(a.fee).toBeGreaterThanOrEqual(need)
+        expect(a.fee - need).toBeLessThanOrEqual(OVERPAY_CEILING_SOMPI)
+      }
+      expect(built).toBeGreaterThan(0)
+    }
+  })
+
+  it('folds the change of a pass it cannot build, where that costs under the overpay ceiling', () => {
+    const a = build(2_499_937n, 100, FULL)
+    expect(a.changeIndex).toBe(-1)
+    expect(a.fee).toBe(2_499_937n)
+    expect(a.fee - requiredFee(measured(a), 100, FULL)).toBeLessThanOrEqual(OVERPAY_CEILING_SOMPI)
+  })
+
+  it('funds a registration with headroom priced on the rate only while blocks are full', () => {
+    expect(fullBlockHeadroom(500, FULL)).toBe(75_000_000n)
+    expect(fullBlockHeadroom(500, 500_000n)).toBe(0n)
+    expect(fullBlockHeadroom(500, null)).toBe(0n)
+    expect(fullBlockHeadroom(1e9, FULL)).toBe(MAX_FEE_SOMPI)
+  })
+
+  it('refuses a coin whose change cannot carry its own storage mass, rather than burn it', () => {
+    expect(() => build(15_170_522n, 100, FULL)).toThrow()
   })
 })
 

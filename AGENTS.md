@@ -99,11 +99,11 @@ prologue. None of that has a second implementation in the corpus.
 README.md describes the two transaction shapes. `transferAssembly`'s `safeJson` and `rpcJson`
 pin both.
 
-### Storage mass is absent from the fee model
+### The fee rules follow the reference implementation
 
-It is absent here exactly as it is absent from the reference implementation's model. Storage mass
-is contextual. The fee iteration cannot see it. A transaction that a node refuses for it is
-`Fatal`.
+README.md states the fee rules. The reference implementation keeps the same rules, and the corpus
+pins the relay floor and the full-block case. A change to either side starts in the reference
+implementation.
 
 ## Writing style
 

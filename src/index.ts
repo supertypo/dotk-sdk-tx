@@ -33,11 +33,21 @@ export {
   MAX_FEE_SOMPI,
   DUST_SOMPI,
   FOLD_CEILING_SOMPI,
+  OVERPAY_CEILING_SOMPI,
   MIN_OUTPUT_VALUE,
 } from './assemble.js'
 export { schnorrSighash, ecdsaSighash, transactionId } from './sighash.js'
 export type { Assembled, AssembleOptions } from './assemble.js'
-export { estimatedSerializedSize, massOverrun, massesOf, relayMinimumFee, requiredFee, storageMassOf } from './mass.js'
+export {
+  estimatedSerializedSize,
+  frontierMass,
+  fullBlockHeadroom,
+  massOverrun,
+  massesOf,
+  relayMinimumFee,
+  requiredFee,
+  storageMassOf,
+} from './mass.js'
 export type { MassOverrun, Masses } from './mass.js'
 export {
   applySignatures,

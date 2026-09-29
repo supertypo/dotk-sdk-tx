@@ -5,7 +5,7 @@ import { TxError } from '../src/errors.js'
 import { transactionId } from '../src/sighash.js'
 import { activateIntent, splitIntent, type Pending } from '../src/register.js'
 import type { Gap } from '../src/release.js'
-import { vectors } from './vectors.js'
+import { readyMassOf, vectors } from './vectors.js'
 
 const registry = new Dotk({ api: null, network: 'testnet-10' }).protocol
 
@@ -17,6 +17,41 @@ const registry = new Dotk({ api: null, network: 'testnet-10' }).protocol
  * over a limit. Replaying them separately would agree with the corpus about two transactions that
  * never have to be funded by one another.
  */
+describe('a commit in a full block', () => {
+  /** A fee that drops after a second coin joins keeps that coin, so the passes settle on one set. */
+  it('settles on two coins where one leaves change too small for its storage mass', () => {
+    const c = vectors.registrationAssembly[0]!
+    const gap: Gap = {
+      lo: c.gap.lo,
+      hi: c.gap.hi,
+      outpoint: { transactionId: c.gap.outpoint[0], index: c.gap.outpoint[1] },
+      amount: BigInt(registry.params.gap_value),
+      scriptPublicKey: c.gap.spk,
+      scriptVersion: 0,
+      blockDaaScore: 0n,
+      isCoinbase: false,
+      covenantId: registry.registryCovenantId,
+    }
+    const split = splitIntent(registry, gap, c.name, c.ownerType, c.owner)
+    const coin = (index: number, amount: bigint) => ({
+      outpoint: { transactionId: 'bb'.repeat(32), index },
+      amount,
+      scriptPublicKey: c.fundingSpk,
+      scriptVersion: 0,
+      blockDaaScore: 0n,
+      isCoinbase: false,
+    })
+    const committed = assemble(split.base, {
+      funding: [coin(1, split.requiredFunding + 14_970_254n), coin(2, 500_000_000n)],
+      changeScriptPublicKey: c.changeSpk,
+      feerate: 150,
+      readyMass: 500_001n,
+      requiredFunding: split.requiredFunding,
+    })
+    expect(committed.fundingInputs).toHaveLength(2)
+  })
+})
+
 describe('a registration agrees with the corpus', () => {
   it.each(vectors.registrationAssembly.map((c) => [c.name, c] as const))('registers %s', (_name, c) => {
     const gap: Gap = {
@@ -47,6 +82,7 @@ describe('a registration agrees with the corpus', () => {
       funding,
       changeScriptPublicKey: c.changeSpk,
       feerate: c.feerate,
+      readyMass: readyMassOf(c),
       requiredFunding: split.requiredFunding,
     })
     expect(committed.fee).toBe(BigInt(c.splitFee))
@@ -85,6 +121,7 @@ describe('a registration agrees with the corpus', () => {
       ],
       changeScriptPublicKey: c.changeSpk,
       feerate: c.feerate,
+      readyMass: readyMassOf(c),
       requiredFunding: activate.requiredFunding,
     })
     expect(revealed.fee).toBe(BigInt(c.activateFee))

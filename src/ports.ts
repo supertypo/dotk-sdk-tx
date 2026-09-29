@@ -32,6 +32,11 @@ export interface TxNode {
   /** The node's current estimate, in sompi per gram. */
   feerate(options?: NodeCallOptions): Promise<number>
   /**
+   * The node's ready mempool mass, or `null` where the node does not report it. Optional. Without
+   * it, the fee is the feerate on the fee mass, and it never ranks by storage mass.
+   */
+  readyMass?(options?: NodeCallOptions): Promise<bigint | null>
+  /**
    * The virtual DAA score, which dates every UTXO the node reports. Optional, and its absence is
    * not an error. Without it this package cannot age a coinbase output, so it can select an
    * immature one that the node then refuses.

@@ -1,4 +1,5 @@
 import { Dotk, encodeActiveDeedState, fromHex, hex32, toHex } from '@dotk/sdk'
+import type { NodeCallOptions } from '@dotk/sdk'
 import { describe, expect, it } from 'vitest'
 import { assemble } from '../src/assemble.js'
 import type { SpendableUtxo } from '../src/ports.js'
@@ -6,7 +7,7 @@ import { transferIntent } from '../src/transfer.js'
 import { toSafeJson, type Tx } from '../src/tx.js'
 import { txNodeOverWasm, txNodeOverWrpc, nodesOver, nodesOverWrpc, toRpcTransaction } from '../src/adapters.js'
 import { encodeRequest, nodeOver, type WrpcJson } from '../src/wrpc.js'
-import { vectors } from './vectors.js'
+import { readyMassOf, vectors } from './vectors.js'
 
 const dotk = new Dotk({ api: null, network: 'testnet-10' })
 const registry = dotk.protocol
@@ -45,6 +46,7 @@ function rebuild(c: (typeof vectors.transferAssembly)[number]) {
     funding,
     changeScriptPublicKey: c.changeSpk,
     feerate: c.feerate,
+    readyMass: readyMassOf(c),
     requiredFunding: 0n,
   }).tx
 }
@@ -187,6 +189,64 @@ describe('the same coin through either client', () => {
   it('prefers the normal bucket over the priority one', async () => {
     expect(await txNodeOverWasm(wasmClient).feerate()).toBe(7)
     expect(await txNodeOverWrpc(wrpcCall).feerate()).toBe(7)
+  })
+
+  describe('the ready mass beside the feerate', () => {
+    const overJson = (experimental: () => unknown) => {
+      const asked: string[] = []
+      const signals: unknown[] = []
+      const call = async (method: string, params: unknown, options?: NodeCallOptions) => {
+        asked.push(method)
+        signals.push(options?.signal)
+        if (method !== 'getFeeEstimateExperimental') throw new Error(`unexpected ${method}`)
+        // A node answers the mass only to a verbose request.
+        const answer = (await experimental()) as { verbose?: unknown } | undefined
+        return (params as { verbose?: boolean }).verbose === true ? answer : { ...answer, verbose: undefined }
+      }
+      return { node: txNodeOverWrpc(call), asked, signals }
+    }
+
+    it('reads the mass from a verbose experimental estimate', async () => {
+      const { node, asked } = overJson(() => ({ verbose: { mempoolReadyTransactionsTotalMass: 500_001 } }))
+      expect(await node.readyMass!()).toBe(500_001n)
+      expect(asked).toEqual(['getFeeEstimateExperimental'])
+    })
+
+    it.each([
+      ['an unknown method', () => Promise.reject(new Error('method not found'))],
+      ['no verbose half', () => ({})],
+      ['a mass that is not a count', () => ({ verbose: { mempoolReadyTransactionsTotalMass: 'lots' } })],
+      ['a negative mass', () => ({ verbose: { mempoolReadyTransactionsTotalMass: -1 } })],
+    ])('answers null on %s', async (_, experimental) => {
+      expect(await overJson(experimental).node.readyMass!()).toBeNull()
+    })
+
+    it('does the same over the wasm client, which may lack the call', async () => {
+      expect(await txNodeOverWasm(wasmClient).readyMass!()).toBeNull()
+      const withIt = {
+        ...wasmClient,
+        getFeeEstimateExperimental: async () => ({ verbose: { mempoolReadyTransactionsTotalMass: 12n } }),
+      }
+      expect(await txNodeOverWasm(withIt).readyMass!()).toBe(12n)
+      const broken = { ...wasmClient, getFeeEstimateExperimental: () => Promise.reject(new Error('gone')) }
+      expect(await txNodeOverWasm(broken).readyMass!()).toBeNull()
+    })
+
+    it('passes the caller signal to the call', async () => {
+      const { node, signals } = overJson(() => ({}))
+      const controller = new AbortController()
+      await node.readyMass!({ signal: controller.signal })
+      expect(signals).toEqual([controller.signal])
+    })
+
+    it('keeps a cancelled call cancelled', async () => {
+      const controller = new AbortController()
+      controller.abort()
+      const call = async () => {
+        throw new Error('aborted')
+      }
+      await expect(txNodeOverWrpc(call).readyMass!({ signal: controller.signal })).rejects.toThrow('aborted')
+    })
   })
 
   it('submits the body the wallet signed, not the rpc shape', async () => {

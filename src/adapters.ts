@@ -45,6 +45,8 @@ export interface TxWasmRpcClient extends ReadWasmClient {
   /** Only reached when a caller gives `txNodeOverWasm` a network to confirm. */
   getServerInfo?(): Promise<{ networkId?: string }>
   getFeeEstimate(request: Record<string, never>): Promise<{ estimate?: FeeEstimate }>
+  /** Experimental in the node. A client without it prices on fee mass. */
+  getFeeEstimateExperimental?(request: { verbose: boolean }): Promise<FeeEstimateExperimental | undefined>
   submitTransaction(request: {
     transaction: unknown
     allowOrphan?: boolean
@@ -60,6 +62,30 @@ interface FeeEstimate {
 /** The bucket this package prices a transfer at, or 1 sompi per gram when the node named none. */
 function feerateOf(estimate: FeeEstimate | undefined): number {
   return estimate?.normalBuckets?.[0]?.feerate ?? estimate?.priorityBucket?.feerate ?? 1
+}
+
+/** `IFeeEstimateExperimental`, as far as this package reads it. */
+interface FeeEstimateExperimental {
+  verbose?: { mempoolReadyTransactionsTotalMass?: unknown } | null
+}
+
+/**
+ * The ready mempool mass from the node's experimental estimate, or `null` where the call fails or
+ * answers without a whole number of grams. A cancelled call stays cancelled.
+ */
+async function readyMassFrom(
+  experimental: () => Promise<FeeEstimateExperimental | undefined>,
+  options: NodeCallOptions | undefined
+): Promise<bigint | null> {
+  let value: unknown
+  try {
+    value = (await experimental())?.verbose?.mempoolReadyTransactionsTotalMass
+  } catch (e) {
+    if (options?.signal?.aborted) throw e
+    return null
+  }
+  if (typeof value === 'bigint') return value >= 0n ? value : null
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? BigInt(value) : null
 }
 
 /**
@@ -99,6 +125,11 @@ export function txNodeOverWasm(client: TxWasmRpcClient | (() => TxWasmRpcClient)
     async feerate(options) {
       await guard(options)
       return feerateOf((await rpc().getFeeEstimate({})).estimate)
+    },
+
+    async readyMass(options) {
+      await guard(options)
+      return readyMassFrom(async () => rpc().getFeeEstimateExperimental?.({ verbose: true }), options)
     },
 
     async submit(tx, options) {
@@ -187,6 +218,14 @@ export function txNodeOverWrpc(call: WrpcCall, network?: string): TxNode {
       await guard(options)
       const answer = (await call('getFeeEstimate', {}, options)) as { estimate?: FeeEstimate }
       return feerateOf(answer.estimate)
+    },
+
+    async readyMass(options) {
+      await guard(options)
+      return readyMassFrom(
+        async () => (await call('getFeeEstimateExperimental', { verbose: true }, options)) as FeeEstimateExperimental,
+        options
+      )
     },
 
     async submit(tx, options) {
