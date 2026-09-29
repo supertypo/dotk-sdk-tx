@@ -1,6 +1,6 @@
 {
   "name": "@dotk/sdk-tx",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "description": "Register, transfer and release .k names on Kaspa: build, sign and submit dotk registry transactions",
   "license": "MIT",
   "author": "s@dotk.name",
