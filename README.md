@@ -411,6 +411,8 @@ at the rate is refused, and another coin is the remedy.
 
 `FeeCeilingError` means the fee came out above 5 KAS. That 5 KAS is a rail and never a setting,
 because the feerate the fee derives from arrives unvalidated from a node the user did not pick.
+If the fee is over 5 KAS for every coin selection that `assemble` tries, it throws this error even
+where the funds also fall short, because more funds cannot lower the fee.
 `InsufficientFundingError` names the shortfall.
 
 A release frees the bond and a gap value, which is more than its fee, so the wallet's part is one

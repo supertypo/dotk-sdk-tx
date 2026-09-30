@@ -294,6 +294,8 @@ export function assemble(base: Tx, options: AssembleOptions): Assembled {
       fee = next
     }
     if (cheapest === undefined) {
+      // Where every built pass needs more than the ceiling, no funds and no fold can help.
+      if (leastNext !== undefined && leastNext > MAX_FEE_SOMPI) throw new FeeCeilingError(leastNext, MAX_FEE_SOMPI)
       // The climb ran past every requirement a built pass had, so the change is what failed.
       const runaway = leastNext !== undefined && failedAt > leastNext + OVERPAY_CEILING_SOMPI
       if (failure !== undefined && !runaway) throw failure

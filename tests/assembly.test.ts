@@ -551,6 +551,22 @@ describe('the fee rules', () => {
   it('refuses a coin whose change cannot carry its own storage mass, rather than burn it', () => {
     expect(() => build(15_170_522n, 100, FULL)).toThrow()
   })
+
+  it('names the ceiling where every pass needs more than it, however short the funds', () => {
+    const coins = Array.from({ length: 360 }, (_, index) => ({
+      ...coin(12_000_000n),
+      outpoint: { transactionId: 'cc'.repeat(32), index },
+    }))
+    const base = transferIntent(registry, registry.deedAbi, deed, c.newOwnerType, c.newOwner).base
+    const options = {
+      funding: coins,
+      changeScriptPublicKey: c.changeSpk,
+      feerate: 1000,
+      readyMass: FULL,
+      requiredFunding: 3_900_000_000n,
+    }
+    expect(() => assemble(base, options)).toThrow(FeeCeilingError)
+  })
 })
 
 describe('a feerate no node would report', () => {

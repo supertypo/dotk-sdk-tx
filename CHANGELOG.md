@@ -2,6 +2,12 @@
 
 The record starts at 1.2.0.
 
+## 2.1.1
+
+- `assemble` throws `FeeCeilingError` where every pass it builds requires more than
+  `MAX_FEE_SOMPI`. It does so even when coin selection also runs short, because more funds cannot
+  help.
+
 ## 2.1.0
 
 - A fee carries no margin. It pays exactly what the node requires, about 4.8% less than before.
